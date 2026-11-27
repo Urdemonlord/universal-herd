@@ -6,7 +6,9 @@
 //! written atomically (temp file + rename). Migrating to SQLite later
 //! means reading this file once and inserting its rows into the new
 //! schema; the field names were chosen to match the BSD table columns
-//! (`parked_paths`, `links`, `services`).
+//! (`parked_paths`, `links`, `services`, `runtime_pins`, `domains`).
+//! Additive fields carry `#[serde(default)]`, so a v1.1 state file
+//! loads fine after the G2/G3 fields were added.
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -56,6 +58,30 @@ pub struct Link {
     pub domain: String,
 }
 
+/// A per-project runtime pin (G2): one project locked to one
+/// installed runtime version. `path` is the canonical project dir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePin {
+    pub path: String,
+    pub runtime: String,
+    /// Pinned version, e.g. `"24.22.1"`; `None` means "whatever is
+    /// installed" (currently unused, kept for forward compatibility).
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+/// A local HTTPS certificate record (G3). The actual key/cert files
+/// live under `certs/` in the config dir; this row is the index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainCert {
+    pub domain: String,
+    pub cert_file: String,
+    pub key_file: String,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub issuer: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceDef {
     pub name: String,
@@ -82,6 +108,12 @@ pub struct State {
     pub links: Vec<Link>,
     #[serde(default)]
     pub services: Vec<ServiceDef>,
+    /// G2 runtime pins, one per project path.
+    #[serde(default)]
+    pub runtime_pins: Vec<RuntimePin>,
+    /// G3 secured domains (certificate index; files live in `certs/`).
+    #[serde(default)]
+    pub domains: Vec<DomainCert>,
 }
 
 /// Validate and normalize a domain. Lowercases the input, appends the
@@ -305,6 +337,50 @@ impl StateStore {
     pub fn service(&self, name: &str) -> Option<&ServiceDef> {
         self.state.services.iter().find(|s| s.name == name)
     }
+
+    /// Set (or replace) a project's runtime pin. At most one pin per
+    /// path; re-pinning the same project overwrites the old pin.
+    pub fn set_runtime_pin(&mut self, pin: RuntimePin) -> StateResult<()> {
+        if pin.runtime.trim().is_empty() {
+            return Err(invalid("runtime pin must name a runtime"));
+        }
+        self.state.runtime_pins.retain(|p| p.path != pin.path);
+        self.state.runtime_pins.push(pin);
+        Ok(())
+    }
+
+    pub fn clear_runtime_pin(&mut self, path: &str) -> StateResult<()> {
+        let before = self.state.runtime_pins.len();
+        self.state.runtime_pins.retain(|p| p.path != path);
+        if self.state.runtime_pins.len() == before {
+            return Err(invalid(format!("path {path:?} has no runtime pin")));
+        }
+        Ok(())
+    }
+
+    pub fn runtime_pin(&self, path: &str) -> Option<&RuntimePin> {
+        self.state.runtime_pins.iter().find(|p| p.path == path)
+    }
+
+    /// Insert or replace a domain's certificate record.
+    pub fn upsert_domain(&mut self, cert: DomainCert) {
+        self.state.domains.retain(|d| d.domain != cert.domain);
+        self.state.domains.push(cert);
+        self.state.domains.sort_by(|a, b| a.domain.cmp(&b.domain));
+    }
+
+    pub fn remove_domain(&mut self, domain: &str) -> StateResult<()> {
+        let before = self.state.domains.len();
+        self.state.domains.retain(|d| d.domain != domain);
+        if self.state.domains.len() == before {
+            return Err(invalid(format!("domain {domain:?} is not secured")));
+        }
+        Ok(())
+    }
+
+    pub fn domain_cert(&self, domain: &str) -> Option<&DomainCert> {
+        self.state.domains.iter().find(|d| d.domain == domain)
+    }
 }
 
 #[cfg(test)]
@@ -418,6 +494,81 @@ mod tests {
         assert_eq!(auto_domain("my_app").as_deref(), Some("my-app.test"));
         assert_eq!(auto_domain("My App!").as_deref(), Some("my-app.test"));
         assert_eq!(auto_domain("---").as_deref(), None);
+    }
+
+    #[test]
+    fn runtime_pins_replace_and_clear() {
+        let dir = tmp_dir("pins");
+        let mut store = StateStore::load(&dir).unwrap();
+        store
+            .set_runtime_pin(RuntimePin {
+                path: "/srv/web".into(),
+                runtime: "node".into(),
+                version: Some("24.22.1".into()),
+            })
+            .unwrap();
+        assert_eq!(store.runtime_pin("/srv/web").unwrap().version.as_deref(), Some("24.22.1"));
+        // Re-pinning replaces, it does not duplicate.
+        store
+            .set_runtime_pin(RuntimePin {
+                path: "/srv/web".into(),
+                runtime: "node".into(),
+                version: Some("22.0.0".into()),
+            })
+            .unwrap();
+        assert_eq!(store.state.runtime_pins.len(), 1);
+        assert_eq!(store.runtime_pin("/srv/web").unwrap().version.as_deref(), Some("22.0.0"));
+        assert!(store.clear_runtime_pin("/srv/other").is_err());
+        store.clear_runtime_pin("/srv/web").unwrap();
+        assert!(store.runtime_pin("/srv/web").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn domain_records_upsert_remove_and_survive_reload() {
+        let dir = tmp_dir("domains");
+        let mut store = StateStore::load(&dir).unwrap();
+        store.upsert_domain(DomainCert {
+            domain: "myapp.test".into(),
+            cert_file: "myapp.test.crt".into(),
+            key_file: "myapp.test.key".into(),
+            created_at: 1_700_000_000,
+            expires_at: 1_771_290_000,
+            issuer: "Herd Local CA".into(),
+        });
+        assert_eq!(store.domain_cert("myapp.test").unwrap().expires_at, 1_771_290_000);
+        // Upsert replaces the row.
+        store.upsert_domain(DomainCert {
+            domain: "myapp.test".into(),
+            cert_file: "myapp.test.crt".into(),
+            key_file: "myapp.test.key".into(),
+            created_at: 1_800_000_000,
+            expires_at: 1_871_290_000,
+            issuer: "Herd Local CA".into(),
+        });
+        assert_eq!(store.state.domains.len(), 1);
+        assert_eq!(store.domain_cert("myapp.test").unwrap().created_at, 1_800_000_000);
+        assert!(store.remove_domain("other.test").is_err());
+        store.save().unwrap();
+        let reloaded = StateStore::load(&dir).unwrap();
+        assert_eq!(reloaded.domain_cert("myapp.test").unwrap().expires_at, 1_871_290_000);
+        store.remove_domain("myapp.test").unwrap();
+        assert!(store.domain_cert("myapp.test").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_state_file_without_new_fields_still_loads() {
+        let dir = tmp_dir("compat");
+        fs::write(
+            dir.join(STATE_FILE),
+            "{\"version\": 1, \"parked_paths\": [], \"links\": [], \"services\": []}",
+        )
+        .unwrap();
+        let store = StateStore::load(&dir).unwrap();
+        assert!(store.state.runtime_pins.is_empty());
+        assert!(store.state.domains.is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

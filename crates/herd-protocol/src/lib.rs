@@ -2,9 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Protocol version. Bumped 1.0 -> 1.1 when the G1 (park/link) and G4
-/// (services) methods were added; see BSD: method or field changes must
+/// (services) methods were added, and 1.1 -> 1.2 for the G2 (isolate)
+/// and G3 (secure) methods; see BSD: method or field changes must
 /// raise the protocol version, not just the app version.
-pub const PROTOCOL_VERSION: &str = "1.1";
+pub const PROTOCOL_VERSION: &str = "1.2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
