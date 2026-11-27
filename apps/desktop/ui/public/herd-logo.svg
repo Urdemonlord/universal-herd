@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="256" height="256" viewBox="0 0 256 256">
+  <title>Universal Herd</title>
+  <g id="Layer_1" data-name="Layer 1">
+    <polygon points="68,20 68,170.94 20,218.94 20,20" fill="#171717"/>
+    <polygon points="68,213.7 68,236 45.7,236" fill="#171717"/>
+    <polygon points="50.94,188 20,218.94 20,188" fill="#171717"/>
+    <polygon points="93.7,188 164,188 164,236 45.7,236" fill="#171717"/>
+    <polygon points="164,20 164,74.94 116,122.94 116,20" fill="#171717"/>
+    <polygon points="164,117.7 164,236 116,236 116,165.7" fill="#171717"/>
+    <polygon points="134.94,104 116,122.94 116,104" fill="#171717"/>
+    <polygon points="177.7,104 236,104 236,146 135.7,146" fill="#171717"/>
+    <polygon points="218.94,20 188,50.94 188,20" fill="#171717"/>
+    <polygon points="236,45.7 236,236 188,236 188,93.7" fill="#171717"/>
+  </g>
+</svg>
