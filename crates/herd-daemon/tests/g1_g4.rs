@@ -215,3 +215,118 @@ async fn g1_park_link_list_and_g4_service_lifecycle() {
 
     fs::remove_dir_all(&base).unwrap();
 }
+
+/// Unpark/unlink must work after the directory was deleted: the stored
+/// registration is matched by its canonical path, not by re-validating
+/// that the directory still exists.
+#[tokio::test]
+async fn unpark_unlink_deleted_directories() {
+    let base = std::env::temp_dir().join(format!("herd-del-dir-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let config_dir = base.join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+    let root = base.join("parked");
+    let outside = base.join("outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("package.json"), "{}").unwrap();
+
+    let state = DaemonState::load(&config_dir).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serve_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        serve(listener, serve_state, "test-token".to_string()).await.unwrap();
+    });
+    let mut client = Client::connect(port).await;
+
+    client.ok("projects.park", json!({"path": root})).await;
+    client.ok("projects.link", json!({"path": outside, "domain": "gone"})).await;
+    let listed = client.ok("projects.list", json!({})).await;
+    assert_eq!(listed["projects"].as_array().unwrap().len(), 1);
+
+    // Delete both directories from the filesystem, then unregister.
+    fs::remove_dir_all(&root).unwrap();
+    fs::remove_dir_all(&outside).unwrap();
+    assert_eq!(client.ok("projects.unlink", json!({"path": outside})).await["linked"], false);
+    assert_eq!(client.ok("projects.unpark", json!({"path": root})).await["parked"], false);
+    // The domain is released: linking another path to it works again.
+    let other = base.join("other");
+    fs::create_dir_all(&other).unwrap();
+    fs::write(other.join("package.json"), "{}").unwrap();
+    let linked = client.ok("projects.link", json!({"path": other, "domain": "gone"})).await;
+    assert_eq!(linked["domain"], "gone.test");
+    // And the deleted paths are gone from the list (only `other` left).
+    let listed = client.ok("projects.list", json!({})).await;
+    let projects = listed["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1, "{projects:?}");
+    assert_eq!(projects[0]["name"], "other");
+
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// Racing `services.start` against `services.remove` must never leave
+/// a process running without a definition: either start wins (the
+/// service stays registered and running) or remove wins (the start
+/// fails). A leaked process is caught by the port it would still hold.
+#[tokio::test]
+async fn start_remove_race_leaves_no_orphan() {
+    let base = std::env::temp_dir().join(format!("herd-race-test-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    let config_dir = base.join("config");
+    fs::create_dir_all(&config_dir).unwrap();
+
+    let state = DaemonState::load(&config_dir).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serve_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        serve(listener, serve_state, "test-token".to_string()).await.unwrap();
+    });
+
+    for round in 0..20 {
+        let name = format!("racer-{round}");
+        let svc_port = free_port();
+        let mut client = Client::connect(port).await;
+        client
+            .ok(
+                "services.create",
+                json!({"name": name, "command": "python3", "args": ["-m", "http.server", svc_port.to_string()], "port": svc_port}),
+            )
+            .await;
+        // Two connections racing: one starts, one removes.
+        let mut starter = Client::connect(port).await;
+        let mut remover = Client::connect(port).await;
+        let name_for_start = name.clone();
+        let name_for_remove = name.clone();
+        let (start_result, remove_result) = tokio::join!(
+            async move { starter.call("services.start", json!({"name": name_for_start})).await },
+            async move { remover.call("services.remove", json!({"name": name_for_remove})).await },
+        );
+        // Exactly one of the two may observe success; a start that
+        // succeeded must find the definition still present, and a
+        // remove that succeeded must mean no process was spawned.
+        let start_ok = start_result.error.is_none();
+        let remove_ok = remove_result.error.is_none();
+        assert!(
+            !(start_ok && remove_ok),
+            "round {round}: both start and remove succeeded; definition removed under a running service"
+        );
+        // Clean up whatever state the race left behind.
+        let listed = client.ok("services.list", json!({})).await;
+        let services = listed["services"].as_array().unwrap();
+        if let Some(entry) = services.iter().find(|s| s["name"] == name) {
+            if entry["status"] == "running" {
+                client.ok("services.stop", json!({"name": name})).await;
+            }
+            client.ok("services.remove", json!({"name": name})).await;
+        }
+        // No leaked process may still hold the port.
+        assert!(
+            std::net::TcpListener::bind(("127.0.0.1", svc_port)).is_ok(),
+            "round {round}: port {svc_port} still held after start/remove race"
+        );
+    }
+
+    fs::remove_dir_all(&base).unwrap();
+}

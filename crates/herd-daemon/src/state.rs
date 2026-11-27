@@ -202,6 +202,24 @@ impl StateStore {
         &self.path
     }
 
+    /// Apply a mutation and persist it: the in-memory state is only
+    /// published after the save succeeds. On any failure (mutation or
+    /// save) the previous state is restored, so a caller told the
+    /// operation failed never observes its effects, and a later
+    /// successful save cannot resurrect it.
+    pub fn apply(&mut self, mutate: impl FnOnce(&mut Self) -> StateResult<()>) -> StateResult<()> {
+        let previous = self.state.clone();
+        if let Err(error) = mutate(self) {
+            self.state = previous;
+            return Err(error);
+        }
+        if let Err(error) = self.save() {
+            self.state = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Write state atomically: temp file in the same directory, fsync,
     /// then rename over the old file. The file is created mode 0600 on
     /// Unix, like `daemon.token`.
@@ -357,6 +375,26 @@ mod tests {
         fs::write(dir.join(STATE_FILE), "{not json").unwrap();
         assert!(StateStore::load(&dir).is_err());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn apply_rolls_back_when_save_fails() {
+        let dir = tmp_dir("apply-rollback");
+        let mut store = StateStore::load(&dir).unwrap();
+        // Deleting the directory makes save fail (no place for the
+        // temp file), so the mutation must not stick in memory either.
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(store.apply(|s| s.park("/a")).is_err());
+        assert!(store.state.parked_paths.is_empty());
+        assert!(store.apply(|s| s.link("/a/web", "web.test".to_string())).is_err());
+        assert!(store.state.links.is_empty());
+        // And a mutation that itself fails leaves state untouched.
+        let dir2 = tmp_dir("apply-rollback2");
+        let mut store2 = StateStore::load(&dir2).unwrap();
+        store2.park("/a").unwrap();
+        assert!(store2.apply(|s| s.park("/a")).is_err());
+        assert_eq!(store2.state.parked_paths, vec!["/a".to_string()]);
+        fs::remove_dir_all(dir2).unwrap();
     }
 
     #[test]
