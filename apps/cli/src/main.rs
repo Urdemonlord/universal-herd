@@ -180,7 +180,9 @@ async fn main() -> Result<()> {
             print_call("projects.set_runtime", params).await
         }
         Command::Projects { command: ProjectCommand::ClearRuntime { path } } => {
-            let absolute = canonical_dir(&path)?;
+            // Clearing must also work after the directory was deleted,
+            // so resolve the stored path without requiring it to exist.
+            let absolute = herd_daemon::stored_dir(&path);
             print_call("projects.clear_runtime", json!({"path": absolute})).await
         }
         Command::Runtimes { command: RuntimeCommand::List } => {

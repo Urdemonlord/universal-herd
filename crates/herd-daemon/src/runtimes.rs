@@ -120,7 +120,10 @@ fn run_version(spec: &RuntimeSpec, binary: &Path) -> Option<String> {
         // Longer than the worker's own 5 s deadline, so a timeout
         // always arrives as the worker's kill-and-reap error instead
         // of detaching the worker a moment before it kills the child.
-        .recv_timeout(Duration::from_secs(6))
+        // 10 s, not 6: on a loaded box the worker thread itself can
+        // be starved past a tight bound, and the 5 s probe contract
+        // is enforced by the worker, not by this guard.
+        .recv_timeout(Duration::from_secs(10))
         .ok()?
         .ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
