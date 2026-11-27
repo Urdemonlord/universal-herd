@@ -378,6 +378,7 @@
         </div>
       </div>
       <div class="top-actions">
+        <button class="btn-secondary" onclick={refresh} disabled={!connected || loading}>{loading ? 'Refreshing…' : 'Refresh'}</button>
         <button class="btn-secondary" onclick={() => goto('Settings')}>Manage</button>
         <button class="icon-button" aria-label="Notifications" title="Notifications" onclick={() => showNotice('No notifications yet.')}><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" /><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" /></svg></button>
         <button class="avatar-button" aria-label="User menu" title="Meow Labs, local machine" onclick={() => showNotice('Signed in locally as Meow Labs.')}>U</button>
@@ -738,7 +739,7 @@
         <div class="panel">
           <div class="panel-head"><h3>How local HTTPS works</h3></div>
           <div class="env-row"><span class="env-num">1</span><strong>Link a project</strong><small>Map a folder to a name like app.test.</small></div>
-          <div class="env-row"><span class="env-num">2</span><strong>Secure the domain</strong><small>One click creates a trusted local certificate.</small></div>
+          <div class="env-row"><span class="env-num">2</span><strong>Secure the domain</strong><small>Run herd domains secure name.test in a terminal to create a local certificate.</small></div>
           <div class="env-row"><span class="env-num">3</span><strong>Open https://name.test</strong><small>Your browser trusts the certificate, no warning.</small></div>
         </div>
         <div class="note-panel info" style="margin-top: 16px;">Certificates are created locally (mkcert or similar). No data leaves this machine.</div>
