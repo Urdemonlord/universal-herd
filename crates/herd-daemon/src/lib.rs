@@ -5,7 +5,7 @@ use herd_core::{ProjectCandidate, detect_project, scan_projects};
 use herd_protocol::{PROTOCOL_VERSION, Request, Response};
 use runtimes::{
     InstallAction, detect_runtimes, find_program, install_plan, known_runtime, known_runtime_names,
-    path_dirs,
+    path_dirs, query_toolchain_version, report_installed_version,
 };
 use serde_json::{Value, json};
 use state::{
@@ -75,6 +75,12 @@ pub struct DaemonState {
     supervisor: Mutex<Supervisor>,
     /// The config directory (state.json, daemon.token, certs/, logs/).
     config_dir: PathBuf,
+    /// Serializes certificate creation (G3): `create_leaf` and
+    /// `ensure_ca` share fixed temp paths, so two concurrent
+    /// `domains.secure` calls could overwrite each other's key/CSR.
+    /// Held across the whole blocking certificate call, and by
+    /// `domains.unsecure` while it deletes the leaf files.
+    certs: Mutex<()>,
 }
 
 impl DaemonState {
@@ -85,6 +91,7 @@ impl DaemonState {
             store: RwLock::new(store),
             supervisor: Mutex::new(supervisor),
             config_dir: dir.to_path_buf(),
+            certs: Mutex::new(()),
         }))
     }
 
@@ -337,6 +344,7 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 Err(message) => return internal_error(request.id, message),
             };
             let InstallAction::ViaRustup { toolchain } = action;
+            let toolchain_for_query = toolchain.clone();
             let installed = tokio::task::spawn_blocking(move || {
                 let output = std::process::Command::new("rustup")
                     .args(["toolchain", "install", &toolchain])
@@ -358,9 +366,25 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                     return internal_error(request.id, format!("install task failed: {error}"));
                 }
             }
-            let detected = tokio::task::spawn_blocking(detect_runtimes).await.unwrap_or_default();
-            let version =
-                detected.iter().find(|r| r.name == "rust").map(|r| r.version.clone()).or(version);
+            // Report the version that was actually installed, not the
+            // daemon's active compiler: `RUSTUP_TOOLCHAIN` can make
+            // re-detection report a different toolchain than the one
+            // just installed.
+            let version = match version {
+                Some(requested) => {
+                    report_installed_version(Some(requested), &toolchain_for_query, None)
+                }
+                None => {
+                    let toolchain = toolchain_for_query.clone();
+                    let queried = tokio::task::spawn_blocking(move || {
+                        let rustup = find_program("rustup", &path_dirs())?;
+                        query_toolchain_version(&rustup, &toolchain)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    report_installed_version(None, &toolchain_for_query, queried)
+                }
+            };
             Response::success(
                 request.id,
                 json!({"runtime": runtime, "version": version, "installed": true}),
@@ -429,10 +453,7 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 version: version.clone(),
             };
             let mut store = state.store.write().await;
-            if let Err(error) = store.set_runtime_pin(pin) {
-                return state_error(request.id, error);
-            }
-            match store.save() {
+            match store.apply(|s| s.set_runtime_pin(pin)) {
                 Ok(()) => Response::success(
                     request.id,
                     json!({"path": path, "runtime": runtime, "version": version}),
@@ -441,16 +462,14 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
             }
         }
         "projects.clear_runtime" => {
-            let path = match canonical_dir(&request, "path") {
-                Ok(path) => path,
+            // Clearing must also work after the directory was deleted,
+            // so resolve the stored path without requiring it to exist.
+            let path = match required_str(&request, "path") {
+                Ok(raw) => path_string(&stored_dir(Path::new(raw))),
                 Err(response) => return response,
             };
-            let path = path_string(&path);
             let mut store = state.store.write().await;
-            if let Err(error) = store.clear_runtime_pin(&path) {
-                return state_error(request.id, error);
-            }
-            match store.save() {
+            match store.apply(|s| s.clear_runtime_pin(&path)) {
                 Ok(()) => Response::success(request.id, json!({"path": path, "pinned": false})),
                 Err(error) => state_error(request.id, error),
             }
@@ -484,6 +503,11 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
             };
             let certs = certs_dir(state.config_dir());
             let domain_for_task = domain.clone();
+            // Serialize certificate creation per config directory:
+            // create_leaf (and ensure_ca) share fixed temp paths, so
+            // two concurrent secures could overwrite each other's
+            // key/CSR. The guard is held across the blocking call.
+            let _cert_guard = state.certs.lock().await;
             let created = tokio::task::spawn_blocking(move || {
                 create_leaf(&certs, &domain_for_task, &openssl)
             })
@@ -504,13 +528,22 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 issuer: CA_ISSUER.to_string(),
             };
             let mut store = state.store.write().await;
-            store.upsert_domain(record);
-            match store.save() {
+            match store.apply(|s| {
+                s.upsert_domain(record);
+                Ok(())
+            }) {
                 Ok(()) => Response::success(
                     request.id,
                     json!({"domain": domain, "secured": true, "expires_at": expires_at, "issuer": CA_ISSUER}),
                 ),
-                Err(error) => state_error(request.id, error),
+                Err(error) => {
+                    // The certificate files were just created but the
+                    // record did not persist: remove them so a retry
+                    // starts clean instead of seeing a stale pair.
+                    let certs = certs_dir(state.config_dir());
+                    let _ = remove_leaf(&certs, &domain);
+                    state_error(request.id, error)
+                }
             }
         }
         "domains.unsecure" => {
@@ -521,15 +554,23 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 Err(response) => return response,
             };
             let certs = certs_dir(state.config_dir());
+            // Delete the files first and propagate failures: removing
+            // the record first would report success while the files
+            // remain, with no retry path left.
+            let _cert_guard = state.certs.lock().await;
+            if let Err(error) = remove_leaf(&certs, &domain) {
+                return internal_error(
+                    request.id,
+                    format!("cannot delete certificate files: {error}"),
+                );
+            }
             let mut store = state.store.write().await;
-            if let Err(error) = store.remove_domain(&domain) {
-                return state_error(request.id, error);
+            match store.apply(|s| s.remove_domain(&domain)) {
+                Ok(()) => {
+                    Response::success(request.id, json!({"domain": domain, "secured": false}))
+                }
+                Err(error) => state_error(request.id, error),
             }
-            if let Err(error) = store.save() {
-                return state_error(request.id, error);
-            }
-            let _ = remove_leaf(&certs, &domain);
-            Response::success(request.id, json!({"domain": domain, "secured": false}))
         }
         "domains.list" => {
             let store = state.store.read().await;

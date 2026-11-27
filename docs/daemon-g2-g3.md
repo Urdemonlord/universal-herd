@@ -42,7 +42,10 @@ outputnya tidak bisa diparse dilewati diam-diam.
 
 Deteksi hanya menjalankan flag versi, tidak pernah mengeksekusi kode
 proyek. Tiap perintah dibatasi 5 detik; yang menggantung dianggap
-tidak terpasang. Deteksi jalan di `spawn_blocking` supaya tidak
+tidak terpasang. Probe yang melewati batas dimatikan dan di-reap
+(dibunuh lalu ditunggu), jadi binary yang menggantung tidak
+membocorkan thread dan proses anak tiap `runtimes.list`.
+Deteksi jalan di `spawn_blocking` supaya tidak
 memblokir loop async daemon.
 
 ### Pin (`projects.set_runtime`)
@@ -57,7 +60,12 @@ memblokir loop async daemon.
 - Pin disimpan di `state.json` (`runtime_pins`, satu pin per path;
   pin ulang menimpa pin lama) dan tampil di `projects.list`.
 - `projects.clear_runtime` menghapus pin; path tanpa pin ditolak
-  `-32602`.
+  `-32602`. Clear tetap jalan walau direktorinya sudah dihapus
+  (path diselesaikan secara leksikal, bukan canonicalize);
+  `set_runtime` tetap menolak path yang tidak ada.
+- Semua mutasi pin dan domain memakai `StateStore::apply`: bila
+  `save()` gagal, state di memori dikembalikan, jadi pin atau record
+  yang gagal tersimpan tidak muncul di `projects.list` / `domains.list`.
 
 ### Install (`runtimes.install`): cakupan yang jujur
 
@@ -69,6 +77,12 @@ Satu-satunya install yang dilakukan adalah mendelegasikan Rust ke
   menjalankan `rustup toolchain install 1.85.0`. Tanpa `version`,
   toolchain-nya `stable`. Nama toolchain yang diterima: `stable`,
   `nightly`, `beta`, atau versi `X.Y.Z`.
+- Versi yang dilaporkan adalah versi yang diminta bila ada; tanpa
+  `version`, daemon menanyakan compiler toolchain itu secara
+  eksplisit (`rustup run <toolchain> rustc --version`), bukan
+  compiler aktif daemon, supaya `RUSTUP_TOOLCHAIN` tidak membuat
+  laporan salah. Bila query itu gagal, nama toolchain yang
+  dilaporkan.
 - Bila `rustup` tidak ada: gagal `-32010` dengan pesan yang meminta
   install rustup dulu dari https://rustup.rs.
 - Runtime lain (node, python, go, php, ruby, composer, npm, cargo):
@@ -105,10 +119,19 @@ leaf per domain yang di-secure. Semua lewat CLI `openssl`:
   `subjectAltName=DNS:<domain>` lewat file ekstensi sementara.
   Catatan: `-addext` pada `x509 -req` tidak ada di OpenSSL 3.0
   (baru di 3.2), jadi SAN ditulis lewat `-extfile`, bukan `-addext`.
+- Pasangan pengganti saat re-secure dibuat di file temporer unik
+  lalu dipasang dengan rename; key hidup tidak pernah ditulis
+  langsung, jadi bila signing gagal pasangan lama tetap utuh.
+  CN dibatasi 64 karakter (batas OpenSSL 3.0): domain yang lebih
+  panjang dipotong (61 karakter + `...`), domain lengkap tetap di
+  SAN. Pembuatan sertifikat diserialkan per config dir dengan
+  mutex, jadi dua `domains.secure` bersamaan tidak bisa menimpa
+  key/CSR satu sama lain.
 - `expires_at` adalah unix timestamp = waktu pembuatan + 825 hari.
 - File di `<config>/certs/`: `ca.key`, `ca.crt`,
   `<domain>.key`, `<domain>.crt`. Private key mode 0600. File
-  `.csr`, `.ext`, dan `.srl` sementara dihapus sesudah dipakai.
+  `.csr`, `.ext`, dan `.srl` sementara dihapus sesudah dipakai,
+  begitu juga file temporer key/crt dan backup saat re-secure.
 - `state.json` menyimpan indeksnya (`domains`: domain, nama file
   cert/key, `created_at`, `expires_at`, `issuer`). File sertifikat
   yang hilang membuat `domains.list` melaporkan domain itu
@@ -124,8 +147,11 @@ leaf per domain yang di-secure. Semua lewat CLI `openssl`:
   jelas, bukan diam-diam tanpa sertifikat.
 - `domains.secure` yang diulang membuat ulang sertifikatnya (record
   di-upsert, masa berlaku dihitung ulang dari sekarang).
-- `domains.unsecure` menghapus record dan file cert/key; domain yang
-  belum secured ditolak `-32602`.
+- `domains.unsecure` menghapus file cert/key dulu, baru record-nya.
+  Bila penghapusan file gagal, handler mengembalikan error dan
+  record dipertahankan, jadi operasi bisa diulang; file yang sudah
+  hilang ditolerir, jadi retry setelah penghapusan parsial tetap
+  jalan. Domain yang belum secured ditolak `-32602`.
 
 ### Yang SENGAJA tidak dibuat
 
@@ -164,16 +190,24 @@ herd domains unsecure <domain>
 
 ## Verifikasi
 
-- `cargo test`: 21 lolos (12 dari G1/G4 + 9 baru: 3 deteksi/install
-  runtime, 2 sertifikat, 3 state pin/domain, 1 integration G2+G3).
-- `cargo clippy --all-targets`: bersih kecuali 2 warning manifest
+- `cargo test --workspace`: 32 lolos (26 lib herd-daemon, 1 g1_g4,
+  4 g2_g3, 1 CLI). Baru di ronde perbaikan ini: 8 unit test
+  (rollback `apply`, `stored_dir`, batas CN, re-secure cocok,
+  domain panjang, pelaporan versi install, query toolchain,
+  probe menggantung di-kill) dan 3 integration test (clear pin
+  setelah direktori dihapus, save gagal tidak meninggalkan pin,
+  unsecure gagal mempertahankan record).
+- `cargo clippy --workspace --all-targets`: bersih kecuali 2 warning manifest
   bawaan v0.1.0 (`repository` dan `authors` di `workspace.package`).
 - `cargo fmt --check`: bersih.
 - Integration test `tests/g2_g3.rs` menjalankan daemon asli di
-  port 0: `runtimes.list` (node + python), pin tampil di
+  port 0: `runtimes.list` (node + python, bentuk versi saja yang
+  diasersi, bukan rilis tertentu, karena VPS menjalankan Node 22
+  sementara sandbox Node 24), pin tampil di
   `projects.list`, penolakan versi/runtime yang salah, install
   node/zig gagal `-32010`, secure/unsecure dengan openssl asli
-  (SAN dicek, `openssl verify` OK, key 0600), dan bila openssl
+  (SAN dicek, `openssl verify` OK, key 0600, modulus key dan crt
+  sama setelah secure ulang), dan bila openssl
   tidak ada, secure gagal `-32010`.
 
 ## Yang belum dites
