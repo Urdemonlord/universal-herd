@@ -237,6 +237,8 @@ dependencies = [
  "directories",
  "herd-core",
  "herd-protocol",
+ "libc",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
