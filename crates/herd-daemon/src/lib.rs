@@ -528,7 +528,10 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 issuer: CA_ISSUER.to_string(),
             };
             let mut store = state.store.write().await;
-            match store.apply(|s| Ok(s.upsert_domain(record))) {
+            match store.apply(|s| {
+                s.upsert_domain(record);
+                Ok(())
+            }) {
                 Ok(()) => Response::success(
                     request.id,
                     json!({"domain": domain, "secured": true, "expires_at": expires_at, "issuer": CA_ISSUER}),
