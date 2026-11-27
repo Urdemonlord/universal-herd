@@ -66,13 +66,6 @@ fn openssl_present() -> bool {
     std::process::Command::new("openssl").arg("version").output().is_ok()
 }
 
-/// A version-shaped string: contains a dot and starts with a digit.
-/// The test must not hardcode a release (the VPS runs Node 22, the
-/// sandbox Node 24); only the shape is asserted.
-fn looks_like_version(version: &str) -> bool {
-    version.contains('.') && version.chars().next().is_some_and(|c| c.is_ascii_digit())
-}
-
 #[tokio::test]
 async fn g2_runtime_pin_and_g3_local_https() {
     let base = std::env::temp_dir().join(format!("herd-g2g3-test-{}", std::process::id()));
