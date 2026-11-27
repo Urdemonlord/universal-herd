@@ -740,9 +740,9 @@
           <div class="panel-head"><h3>How local HTTPS works</h3></div>
           <div class="env-row"><span class="env-num">1</span><strong>Link a project</strong><small>Map a folder to a name like app.test.</small></div>
           <div class="env-row"><span class="env-num">2</span><strong>Secure the domain</strong><small>Run herd domains secure name.test in a terminal to create a local certificate.</small></div>
-          <div class="env-row"><span class="env-num">3</span><strong>Open https://name.test</strong><small>Your browser trusts the certificate, no warning.</small></div>
+          <div class="env-row"><span class="env-num">3</span><strong>Open https://name.test</strong><small>Trust the local CA in your browser once, then no warning.</small></div>
         </div>
-        <div class="note-panel info" style="margin-top: 16px;">Certificates are created locally (mkcert or similar). No data leaves this machine.</div>
+        <div class="note-panel info" style="margin-top: 16px;">Certificates are created locally with the daemon's own CA (OpenSSL). No data leaves this machine.</div>
       {:else if active === 'Containers'}
         <div class="note-panel info">No container runtime is connected yet. Connect Docker or Podman to list containers running on this machine.</div>
         <div class="empty-state">
