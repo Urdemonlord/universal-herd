@@ -8,7 +8,9 @@ license.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 herd-core = { path = "../herd-core" }
+libc.workspace = true
 herd-protocol = { path = "../herd-protocol" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
