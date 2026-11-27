@@ -113,7 +113,9 @@ async fn main() -> Result<()> {
             print_call("projects.park", json!({"path": absolute})).await
         }
         Command::Projects { command: ProjectCommand::Unpark { path } } => {
-            let absolute = canonical_dir(&path)?;
+            // Unpark must also work after the directory was deleted, so
+            // resolve the stored path without requiring it to exist.
+            let absolute = herd_daemon::stored_dir(&path);
             print_call("projects.unpark", json!({"path": absolute})).await
         }
         Command::Projects { command: ProjectCommand::Link { path, domain } } => {
@@ -121,7 +123,7 @@ async fn main() -> Result<()> {
             print_call("projects.link", json!({"path": absolute, "domain": domain})).await
         }
         Command::Projects { command: ProjectCommand::Unlink { path } } => {
-            let absolute = canonical_dir(&path)?;
+            let absolute = herd_daemon::stored_dir(&path);
             print_call("projects.unlink", json!({"path": absolute})).await
         }
         Command::Projects { command: ProjectCommand::List { depth } } => {
@@ -141,7 +143,11 @@ async fn main() -> Result<()> {
                 params["port"] = json!(port);
             }
             if let Some(workdir) = workdir {
-                params["workdir"] = json!(workdir);
+                // Canonicalize so the daemon receives the absolute
+                // directory the user meant, not a path relative to
+                // wherever the daemon was launched.
+                let absolute = canonical_dir(&workdir)?;
+                params["workdir"] = json!(absolute);
             }
             print_call("services.create", params).await
         }

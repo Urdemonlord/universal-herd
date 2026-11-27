@@ -64,7 +64,9 @@ Aturan domain (`normalize_domain`): huruf kecil, suffix default
 tidak boleh ada label kosong. Domain duplikat dan path yang sudah
 ter-link ditolak dengan `-32602`. Path di-canonicalize sebelum
 disimpan, jadi `/home/arya/code/../code` dan `/home/arya/code`
-dianggap path yang sama.
+dianggap path yang sama. `unpark`/`unlink` tetap bisa menghapus
+registrasi yang direktorinya sudah dihapus: path dicocokkan dengan
+path canonical yang tersimpan tanpa mengharuskan direktori masih ada.
 
 `projects.list` memindai tiap parked path (kedalaman 3) dan menambahkan
 tiap linked path secara langsung. Tiap proyek diperkaya:
@@ -120,11 +122,15 @@ atau mati karena sinyal; service yang di-stop supervisor tercatat
 `stopped`, bukan `failed`.
 
 Supervisi: proses anak di-spawn sebagai process-group leader di Unix,
-jadi `stop` mengirim SIGTERM ke seluruh group (anak + cucu), tunggu
-maksimal 3 detik, lalu SIGKILL, lalu kill anak langsung sebagai
-pengaman. Service yang keluar sendiri dalam 100 ms pertama setelah
+jadi `stop` mengirim SIGTERM ke seluruh group (anak + cucu), lalu
+menunggu sampai group itu kosong (bukan hanya sampai anak langsung
+keluar) selama maksimal 3 detik, lalu SIGKILL anggota yang tersisa.
+Service yang keluar sendiri dalam 100 ms pertama setelah
 start dilaporkan gagal start beserta exit code-nya, bukan dilaporkan
-berhasil lalu mati diam-diam.
+berhasil lalu mati diam-diam. `services.logs` membaca dari akhir file
+dengan buffer terbatas (maksimal ~1 MiB), jadi log yang tumbuh sampai
+gigabyte tidak membebani memori daemon; satu baris yang luar biasa
+panjang dipotong di 64 KiB.
 
 Contoh:
 

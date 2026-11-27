@@ -9,7 +9,7 @@ use state::{
 };
 use std::{
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -171,6 +171,34 @@ fn canonical_dir(request: &Request, field: &str) -> Result<PathBuf, Response> {
     Ok(path)
 }
 
+/// Resolve a path naming a stored registration (unpark/unlink):
+/// canonicalize when the directory still exists, otherwise absolutize
+/// lexically (relative to the current directory) without touching the
+/// filesystem, so a deleted directory can still be unregistered.
+/// A symlinked path whose target is gone will not match the stored
+/// canonical path; that case still reports "not parked/linked".
+pub fn stored_dir(raw: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(raw) {
+        return canonical;
+    }
+    let absolute = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")).join(raw)
+    };
+    let mut out = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -211,25 +239,18 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
             };
             let path = path_string(&path);
             let mut store = state.store.write().await;
-            if let Err(error) = store.park(&path) {
-                return state_error(request.id, error);
-            }
-            match store.save() {
+            match store.apply(|s| s.park(&path)) {
                 Ok(()) => Response::success(request.id, json!({"path": path, "parked": true})),
                 Err(error) => state_error(request.id, error),
             }
         }
         "projects.unpark" => {
-            let path = match canonical_dir(&request, "path") {
-                Ok(path) => path,
+            let path = match required_str(&request, "path") {
+                Ok(raw) => path_string(&stored_dir(Path::new(raw))),
                 Err(response) => return response,
             };
-            let path = path_string(&path);
             let mut store = state.store.write().await;
-            if let Err(error) = store.unpark(&path) {
-                return state_error(request.id, error);
-            }
-            match store.save() {
+            match store.apply(|s| s.unpark(&path)) {
                 Ok(()) => Response::success(request.id, json!({"path": path, "parked": false})),
                 Err(error) => state_error(request.id, error),
             }
@@ -247,25 +268,18 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
             };
             let path = path_string(&path);
             let mut store = state.store.write().await;
-            if let Err(error) = store.link(&path, domain.clone()) {
-                return state_error(request.id, error);
-            }
-            match store.save() {
+            match store.apply(|s| s.link(&path, domain.clone())) {
                 Ok(()) => Response::success(request.id, json!({"path": path, "domain": domain})),
                 Err(error) => state_error(request.id, error),
             }
         }
         "projects.unlink" => {
-            let path = match canonical_dir(&request, "path") {
-                Ok(path) => path,
+            let path = match required_str(&request, "path") {
+                Ok(raw) => path_string(&stored_dir(Path::new(raw))),
                 Err(response) => return response,
             };
-            let path = path_string(&path);
             let mut store = state.store.write().await;
-            if let Err(error) = store.unlink(&path) {
-                return state_error(request.id, error);
-            }
-            match store.save() {
+            match store.apply(|s| s.unlink(&path)) {
                 Ok(()) => Response::success(request.id, json!({"path": path, "linked": false})),
                 Err(error) => state_error(request.id, error),
             }
@@ -395,10 +409,7 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
             };
             let def = ServiceDef { name, command, args, port, workdir, kind };
             let mut store = state.store.write().await;
-            if let Err(error) = store.add_service(def.clone()) {
-                return state_error(request.id, error);
-            }
-            match store.save() {
+            match store.apply(|s| s.add_service(def.clone())) {
                 Ok(()) => Response::success(request.id, serde_json::to_value(def).unwrap()),
                 Err(error) => state_error(request.id, error),
             }
@@ -408,16 +419,16 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 Ok(name) => name.to_string(),
                 Err(response) => return response,
             };
-            let def = {
-                let store = state.store.read().await;
-                match store.service(&name) {
-                    Some(def) => def.clone(),
-                    None => {
-                        return invalid_params(
-                            request.id,
-                            format!("service {name:?} does not exist"),
-                        );
-                    }
+            // Hold the store read guard across the supervisor lock and
+            // the spawn: `services.remove` needs the write lock to
+            // delete a definition, so it cannot interleave between this
+            // lookup and the spawn. Lock order everywhere is
+            // store-then-supervisor; never the reverse.
+            let store = state.store.read().await;
+            let def = match store.service(&name) {
+                Some(def) => def.clone(),
+                None => {
+                    return invalid_params(request.id, format!("service {name:?} does not exist"));
                 }
             };
             let mut supervisor = state.supervisor.lock().await;
@@ -451,7 +462,13 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 Ok(name) => name.to_string(),
                 Err(response) => return response,
             };
-            {
+            // Same lock order as `services.start` (store, then
+            // supervisor): the running check and the definition removal
+            // are atomic with respect to a concurrent start, so a
+            // removed service can never keep running without a
+            // definition.
+            let log_path = {
+                let mut store = state.store.write().await;
                 let mut supervisor = state.supervisor.lock().await;
                 if supervisor.is_running(&name) {
                     return invalid_params(
@@ -459,15 +476,11 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                         format!("service {name:?} is running; stop it first"),
                     );
                 }
-            }
-            let mut store = state.store.write().await;
-            if let Err(error) = store.remove_service(&name) {
-                return state_error(request.id, error);
-            }
-            if let Err(error) = store.save() {
-                return state_error(request.id, error);
-            }
-            let log_path = state.supervisor.lock().await.log_path(&name);
+                if let Err(error) = store.apply(|s| s.remove_service(&name)) {
+                    return state_error(request.id, error);
+                }
+                supervisor.log_path(&name)
+            };
             let _ = fs::remove_file(log_path);
             Response::success(request.id, json!({"name": name, "removed": true}))
         }
@@ -476,11 +489,9 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 Ok(name) => name.to_string(),
                 Err(response) => return response,
             };
-            {
-                let store = state.store.read().await;
-                if store.service(&name).is_none() {
-                    return invalid_params(request.id, format!("service {name:?} does not exist"));
-                }
+            let store = state.store.read().await;
+            if store.service(&name).is_none() {
+                return invalid_params(request.id, format!("service {name:?} does not exist"));
             }
             let lines =
                 request.params.get("lines").and_then(|v| v.as_u64()).unwrap_or(100) as usize;
@@ -520,4 +531,31 @@ pub fn token_path() -> Result<PathBuf> {
 
 pub fn read_token() -> io::Result<String> {
     Ok(fs::read_to_string(token_path().map_err(io::Error::other)?)?.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stored_dir_canonicalizes_when_present_and_absolutizes_when_deleted() {
+        let base =
+            std::env::temp_dir().join(format!("herd-stored-dir-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let target = base.join("sub").join("proj");
+        fs::create_dir_all(&target).unwrap();
+        // Existing directory: canonicalized (resolves `.` segments).
+        assert_eq!(stored_dir(&base.join("sub").join(".").join("proj")), target);
+        // Deleted directory: no filesystem access, but the absolute
+        // path (with `.`/`..` resolved lexically) is still returned.
+        fs::remove_dir_all(&base).unwrap();
+        assert_eq!(stored_dir(&target), target);
+        assert_eq!(stored_dir(&base.join("sub").join("..").join("sub").join("proj")), target);
+        // A relative path is resolved against the current directory.
+        let cwd = std::env::current_dir().unwrap();
+        let relative = target.strip_prefix(&cwd).ok().map(|p| p.to_path_buf());
+        if let Some(relative) = relative {
+            assert_eq!(stored_dir(&relative), target);
+        }
+    }
 }
