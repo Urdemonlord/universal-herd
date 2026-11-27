@@ -26,6 +26,28 @@ pub const CA_DAYS: u64 = 3650;
 pub const LEAF_DAYS: u64 = 825;
 pub const CA_SUBJECT: &str = "/CN=Herd Local CA";
 pub const CA_ISSUER: &str = "Herd Local CA";
+/// OpenSSL 3.0 limits `commonName` to 64 characters.
+pub const MAX_CN_LEN: usize = 64;
+
+/// Suffix that makes temp/backup paths unique per call, so a failed
+/// re-secure never touches the live pair and two calls can never
+/// collide on a temp name.
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// The certificate subject for a domain. A domain longer than the
+/// OpenSSL CN limit is truncated with an ellipsis; the full domain is
+/// always carried in `subjectAltName`, so long domains stay securable.
+pub fn leaf_cn(domain: &str) -> String {
+    if domain.chars().count() <= MAX_CN_LEN {
+        domain.to_string()
+    } else {
+        let head: String = domain.chars().take(MAX_CN_LEN - 3).collect();
+        format!("{}...", head.trim_end_matches('.'))
+    }
+}
 
 pub fn certs_dir(config_dir: &Path) -> PathBuf {
     config_dir.join("certs")
@@ -119,6 +141,10 @@ pub fn ensure_ca(certs: &Path, openssl: &Path) -> Result<(), String> {
 /// Create (or replace) the leaf certificate for a domain, signed by
 /// the local CA. Returns the expiry as a unix timestamp, computed
 /// from the validity requested (`LEAF_DAYS` from now).
+///
+/// The replacement pair is generated in temporary files and installed
+/// with renames; the live key is never written directly. If any step
+/// fails, the previous pair stays untouched.
 pub fn create_leaf(certs: &Path, domain: &str, openssl: &Path) -> Result<u64, String> {
     ensure_ca(certs, openssl)?;
     let key = leaf_key_path(certs, domain);
@@ -131,6 +157,11 @@ pub fn create_leaf(certs: &Path, domain: &str, openssl: &Path) -> Result<u64, St
     // small extensions file instead.
     fs::write(&ext, format!("[v3_req]\nsubjectAltName=DNS:{domain}\n"))
         .map_err(|e| format!("cannot write {}: {e}", ext.display()))?;
+    let suffix = unique_suffix();
+    let key_tmp = certs.join(format!("{domain}.key.tmp-{suffix}"));
+    let crt_tmp = certs.join(format!("{domain}.crt.tmp-{suffix}"));
+    let key_bak = certs.join(format!("{domain}.key.bak-{suffix}"));
+    let crt_bak = certs.join(format!("{domain}.crt.bak-{suffix}"));
     let result = (|| {
         run(
             openssl,
@@ -139,12 +170,12 @@ pub fn create_leaf(certs: &Path, domain: &str, openssl: &Path) -> Result<u64, St
                 "-newkey",
                 "rsa:2048",
                 "-keyout",
-                key.to_str().unwrap(),
+                key_tmp.to_str().unwrap(),
                 "-out",
                 csr.to_str().unwrap(),
                 "-nodes",
                 "-subj",
-                &format!("/CN={domain}"),
+                &format!("/CN={}", leaf_cn(domain)),
             ],
         )?;
         run(
@@ -160,7 +191,7 @@ pub fn create_leaf(certs: &Path, domain: &str, openssl: &Path) -> Result<u64, St
                 ca_key_path(certs).to_str().unwrap(),
                 "-CAcreateserial",
                 "-out",
-                crt.to_str().unwrap(),
+                crt_tmp.to_str().unwrap(),
                 "-days",
                 &LEAF_DAYS.to_string(),
                 "-extfile",
@@ -169,14 +200,72 @@ pub fn create_leaf(certs: &Path, domain: &str, openssl: &Path) -> Result<u64, St
                 "v3_req",
             ],
         )?;
-        chmod_0600(&key).map_err(|e| format!("cannot restrict {}: {e}", key.display()))?;
+        chmod_0600(&key_tmp).map_err(|e| format!("cannot restrict {}: {e}", key_tmp.display()))?;
+        install_pair(&key, &crt, &key_tmp, &crt_tmp, &key_bak, &crt_bak)?;
         Ok::<(), String>(())
     })();
+    // Cleanup is best-effort and covers every temp file, including the
+    // backups once the new pair is installed.
     let _ = fs::remove_file(&csr);
     let _ = fs::remove_file(&ext);
     let _ = fs::remove_file(&serial);
+    let _ = fs::remove_file(&key_tmp);
+    let _ = fs::remove_file(&crt_tmp);
+    let _ = fs::remove_file(&key_bak);
+    let _ = fs::remove_file(&crt_bak);
     result?;
     Ok(unix_now() + LEAF_DAYS * 86400)
+}
+
+/// Move a freshly generated (key, crt) pair into place, preserving
+/// the previous pair until the new one is fully installed. On any
+/// failure the old pair is restored and the error returned, so a
+/// half-installed pair can never be observed.
+fn install_pair(
+    key: &Path,
+    crt: &Path,
+    key_tmp: &Path,
+    crt_tmp: &Path,
+    key_bak: &Path,
+    crt_bak: &Path,
+) -> Result<(), String> {
+    let mut backed_up_key = false;
+    let mut backed_up_crt = false;
+    let mut installed_key = false;
+    let mut installed_crt = false;
+    let result = (|| -> Result<(), String> {
+        if key.is_file() {
+            fs::rename(key, key_bak)
+                .map_err(|e| format!("cannot back up {}: {e}", key.display()))?;
+            backed_up_key = true;
+        }
+        if crt.is_file() {
+            fs::rename(crt, crt_bak)
+                .map_err(|e| format!("cannot back up {}: {e}", crt.display()))?;
+            backed_up_crt = true;
+        }
+        fs::rename(key_tmp, key).map_err(|e| format!("cannot install {}: {e}", key.display()))?;
+        installed_key = true;
+        fs::rename(crt_tmp, crt).map_err(|e| format!("cannot install {}: {e}", crt.display()))?;
+        installed_crt = true;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if installed_key {
+            let _ = fs::remove_file(key);
+        }
+        if installed_crt {
+            let _ = fs::remove_file(crt);
+        }
+        if backed_up_key {
+            let _ = fs::rename(key_bak, key);
+        }
+        if backed_up_crt {
+            let _ = fs::rename(crt_bak, crt);
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// Delete a domain's leaf key and certificate. Missing files are fine.
@@ -265,6 +354,94 @@ mod tests {
         }
         remove_leaf(&dir, "myapp.test").unwrap();
         assert!(!leaf_exists(&dir, "myapp.test"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn leaf_cn_is_bounded() {
+        assert_eq!(leaf_cn("myapp.test"), "myapp.test");
+        assert_eq!(leaf_cn(&"a".repeat(64)), "a".repeat(64));
+        let long = format!("{}.test", "a".repeat(60));
+        assert_eq!(long.chars().count(), 65);
+        let cn = leaf_cn(&long);
+        // 61-char prefix ends on the '.' before "test", so it is
+        // trimmed before the ellipsis is added.
+        assert_eq!(cn, format!("{}...", "a".repeat(60)));
+        assert_eq!(leaf_cn(&"a".repeat(65)), format!("{}...", "a".repeat(61)));
+    }
+
+    /// The modulus of a key and its certificate must match; comparing
+    /// them is how a mismatched pair (the old re-secure bug) is caught.
+    fn modulus(openssl: &Path, kind: &str, path: &Path) -> String {
+        run(openssl, &[kind, "-in", path.to_str().unwrap(), "-noout", "-modulus"]).unwrap()
+    }
+
+    fn no_temp_files_left(dir: &Path) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let name = entry.unwrap().file_name().to_string_lossy().to_string();
+            assert!(
+                !name.contains(".tmp-") && !name.contains(".bak-"),
+                "leftover temp file: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn re_securing_keeps_key_and_cert_matched() {
+        let Some(openssl) = openssl_or_skip() else { return };
+        let dir = tmp_certs("resecure");
+        create_leaf(&dir, "myapp.test", &openssl).unwrap();
+        let key_before = fs::read(leaf_key_path(&dir, "myapp.test")).unwrap();
+        let crt_before = fs::read(leaf_crt_path(&dir, "myapp.test")).unwrap();
+        assert_eq!(
+            modulus(&openssl, "rsa", &leaf_key_path(&dir, "myapp.test")),
+            modulus(&openssl, "x509", &leaf_crt_path(&dir, "myapp.test"))
+        );
+        // Re-securing regenerates the pair; key and cert still match.
+        create_leaf(&dir, "myapp.test", &openssl).unwrap();
+        assert_ne!(fs::read(leaf_key_path(&dir, "myapp.test")).unwrap(), key_before);
+        assert_ne!(fs::read(leaf_crt_path(&dir, "myapp.test")).unwrap(), crt_before);
+        assert_eq!(
+            modulus(&openssl, "rsa", &leaf_key_path(&dir, "myapp.test")),
+            modulus(&openssl, "x509", &leaf_crt_path(&dir, "myapp.test"))
+        );
+        let verify = run(
+            &openssl,
+            &[
+                "verify",
+                "-CAfile",
+                ca_crt_path(&dir).to_str().unwrap(),
+                leaf_crt_path(&dir, "myapp.test").to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        assert!(verify.contains("OK"), "{verify}");
+        no_temp_files_left(&dir);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn long_domain_secures_with_truncated_cn() {
+        let Some(openssl) = openssl_or_skip() else { return };
+        let dir = tmp_certs("longdomain");
+        // 60 'a' + ".test" = 65 chars: over the OpenSSL CN limit.
+        let domain = format!("{}.test", "a".repeat(60));
+        create_leaf(&dir, &domain, &openssl).unwrap();
+        assert!(leaf_exists(&dir, &domain));
+        let text = run(
+            &openssl,
+            &["x509", "-in", leaf_crt_path(&dir, &domain).to_str().unwrap(), "-noout", "-text"],
+        )
+        .unwrap();
+        assert!(text.contains(&format!("DNS:{domain}")), "{text}");
+        // The full domain is in the SAN; the CN is truncated to 64.
+        let subject = run(
+            &openssl,
+            &["x509", "-in", leaf_crt_path(&dir, &domain).to_str().unwrap(), "-noout", "-subject"],
+        )
+        .unwrap();
+        assert!(subject.contains(&format!("CN = {}...", "a".repeat(60))), "{subject}");
+        no_temp_files_left(&dir);
         fs::remove_dir_all(dir).unwrap();
     }
 
