@@ -5,7 +5,7 @@ use herd_core::{ProjectCandidate, detect_project, scan_projects};
 use herd_protocol::{PROTOCOL_VERSION, Request, Response};
 use runtimes::{
     InstallAction, detect_runtimes, find_program, install_plan, known_runtime, known_runtime_names,
-    path_dirs,
+    path_dirs, query_toolchain_version, report_installed_version,
 };
 use serde_json::{Value, json};
 use state::{
@@ -337,6 +337,7 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                 Err(message) => return internal_error(request.id, message),
             };
             let InstallAction::ViaRustup { toolchain } = action;
+            let toolchain_for_query = toolchain.clone();
             let installed = tokio::task::spawn_blocking(move || {
                 let output = std::process::Command::new("rustup")
                     .args(["toolchain", "install", &toolchain])
@@ -358,9 +359,25 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                     return internal_error(request.id, format!("install task failed: {error}"));
                 }
             }
-            let detected = tokio::task::spawn_blocking(detect_runtimes).await.unwrap_or_default();
-            let version =
-                detected.iter().find(|r| r.name == "rust").map(|r| r.version.clone()).or(version);
+            // Report the version that was actually installed, not the
+            // daemon's active compiler: `RUSTUP_TOOLCHAIN` can make
+            // re-detection report a different toolchain than the one
+            // just installed.
+            let version = match version {
+                Some(requested) => {
+                    report_installed_version(Some(requested), &toolchain_for_query, None)
+                }
+                None => {
+                    let toolchain = toolchain_for_query.clone();
+                    let queried = tokio::task::spawn_blocking(move || {
+                        let rustup = find_program("rustup", &path_dirs())?;
+                        query_toolchain_version(&rustup, &toolchain)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    report_installed_version(None, &toolchain_for_query, queried)
+                }
+            };
             Response::success(
                 request.id,
                 json!({"runtime": runtime, "version": version, "installed": true}),

@@ -13,6 +13,7 @@
 
 use serde::Serialize;
 use std::{
+    io,
     path::{Path, PathBuf},
     process::Command,
     sync::mpsc,
@@ -112,15 +113,46 @@ fn run_version(spec: &RuntimeSpec, binary: &Path) -> Option<String> {
     let binary = binary.to_path_buf();
     let args: Vec<String> = spec.version_args.iter().map(|a| a.to_string()).collect();
     std::thread::spawn(move || {
-        let output = Command::new(&binary).args(&args).output();
+        let output = run_version_child(&binary, &args);
         let _ = tx.send(output);
     });
-    let output = rx.recv_timeout(Duration::from_secs(5)).ok()?.ok()?;
+    let output = rx
+        // Longer than the worker's own 5 s deadline, so a timeout
+        // always arrives as the worker's kill-and-reap error instead
+        // of detaching the worker a moment before it kills the child.
+        .recv_timeout(Duration::from_secs(6))
+        .ok()?
+        .ok()?;
     let mut text = String::from_utf8_lossy(&output.stdout).to_string();
     if text.trim().is_empty() {
         text = String::from_utf8_lossy(&output.stderr).to_string();
     }
     extract_version(&text)
+}
+
+/// Run a version command with a hard deadline. The child is spawned
+/// with an explicit handle (not `Command::output`, which waits
+/// forever): on timeout it is killed and reaped before returning, so
+/// a hanging binary cannot leak a thread and a process per probe.
+fn run_version_child(binary: &Path, args: &[String]) -> io::Result<std::process::Output> {
+    use std::process::Stdio;
+    let mut child =
+        Command::new(binary).args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "version probe timed out"));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    child.wait_with_output()
 }
 
 /// Detect installed runtimes by running each known binary's version
@@ -187,6 +219,36 @@ pub fn install_plan(
         ));
     }
     Ok(InstallAction::ViaRustup { toolchain: toolchain.to_string() })
+}
+
+/// Resolve the version reported after `runtimes.install`.
+///
+/// A requested version is reported as-is: re-detecting the daemon's
+/// active compiler can report a different toolchain when
+/// `RUSTUP_TOOLCHAIN` overrides it. Without a requested version, the
+/// version of the installed toolchain itself (queried via
+/// `rustup run <toolchain>`) is reported, falling back to the
+/// toolchain name when that query fails.
+pub fn report_installed_version(
+    requested: Option<String>,
+    toolchain: &str,
+    queried: Option<String>,
+) -> String {
+    if let Some(version) = requested {
+        return version;
+    }
+    queried.unwrap_or_else(|| toolchain.to_string())
+}
+
+/// Query one toolchain's compiler version explicitly, so the answer
+/// cannot be skewed by the daemon's active toolchain override.
+pub fn query_toolchain_version(rustup: &Path, toolchain: &str) -> Option<String> {
+    let output =
+        Command::new(rustup).args(["run", toolchain, "rustc", "--version"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    extract_version(&String::from_utf8_lossy(&output.stdout))
 }
 
 /// Human install hint per runtime, used in the -32010 error when the
@@ -271,6 +333,73 @@ mod tests {
         assert!(by_name("php").is_none());
         assert!(by_name("npm").is_none());
         assert!(by_name("rust").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn installed_version_reporting_prefers_the_request() {
+        // A requested version is reported as-is, even when a query
+        // would find something else (RUSTUP_TOOLCHAIN override).
+        assert_eq!(
+            report_installed_version(Some("1.85.0".into()), "1.85.0", Some("1.90.0".into())),
+            "1.85.0"
+        );
+        // No request: the queried toolchain version wins.
+        assert_eq!(report_installed_version(None, "stable", Some("1.90.0".into())), "1.90.0");
+        // Query failed: fall back to the toolchain name, not null.
+        assert_eq!(report_installed_version(None, "stable", None), "stable");
+    }
+
+    #[test]
+    fn toolchain_version_query_uses_the_named_toolchain() {
+        let dir = std::env::temp_dir()
+            .join(format!("herd-runtime-test-rustup-query-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let rustup = dir.join("rustup");
+        // Only answer when invoked as `rustup run <toolchain> rustc
+        // --version`; anything else is a failure, so the test proves
+        // the toolchain is passed explicitly.
+        fs::write(
+            &rustup,
+            "#!/bin/sh\nif [ \"$1\" = \"run\" ] && [ \"$2\" = \"1.85.0\" ]; then echo \"rustc 1.85.0 (abc 2025-01-01)\"; else echo \"wrong args: $*\" >&2; exit 1; fi\n",
+        )
+        .unwrap();
+        fs::set_permissions(&rustup, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(query_toolchain_version(&rustup, "1.85.0").as_deref(), Some("1.85.0"));
+        assert!(query_toolchain_version(&rustup, "1.90.0").is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn hanging_version_probe_is_killed_and_reaped() {
+        let dir =
+            std::env::temp_dir().join(format!("herd-runtime-test-hang-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("hang.pid");
+        let script = dir.join("hangbin");
+        // `exec` makes the script process itself the sleeper, so
+        // killing its pid kills the sleep instead of orphaning it.
+        fs::write(&script, format!("#!/bin/sh\necho $$ > {}\nexec sleep 30\n", pid_file.display()))
+            .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = RuntimeSpec {
+            name: "hang",
+            display: "Hang",
+            binary: "hangbin",
+            version_args: &["--version"],
+        };
+        let start = std::time::Instant::now();
+        assert!(run_version(&spec, &script).is_none());
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(15), "probe took {elapsed:?}");
+        assert!(elapsed >= Duration::from_secs(4), "probe returned too fast: {elapsed:?}");
+        // The child must be gone, not just detached: no /proc entry
+        // left, which also rules out an unreaped zombie.
+        let pid: u32 = fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        assert!(!Path::new(&format!("/proc/{pid}")).exists(), "hanging child {pid} still alive");
         fs::remove_dir_all(dir).unwrap();
     }
 
