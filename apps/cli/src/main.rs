@@ -32,6 +32,16 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
+    /// Detect runtimes installed on this machine and install new ones.
+    Runtimes {
+        #[command(subcommand)]
+        command: RuntimeCommand,
+    },
+    /// Manage local domains and their HTTPS certificates.
+    Domains {
+        #[command(subcommand)]
+        command: DomainCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -56,6 +66,38 @@ enum ProjectCommand {
         #[arg(long, default_value_t = 3)]
         depth: usize,
     },
+    /// Pin a project to one installed runtime version.
+    SetRuntime {
+        path: PathBuf,
+        runtime: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// Remove a project's runtime pin.
+    ClearRuntime { path: PathBuf },
+}
+
+#[derive(Subcommand)]
+enum RuntimeCommand {
+    /// List runtimes detected on this machine.
+    List,
+    /// Install a runtime version. Only Rust (via rustup) is installed
+    /// by the daemon; anything else fails with a manual-install hint.
+    Install {
+        runtime: String,
+        #[arg(long)]
+        version: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DomainCommand {
+    /// List known domains with their certificate status.
+    List,
+    /// Create a local CA (once) and a certificate for a linked domain.
+    Secure { domain: String },
+    /// Delete a domain's certificate.
+    Unsecure { domain: String },
 }
 
 #[derive(Subcommand)]
@@ -128,6 +170,37 @@ async fn main() -> Result<()> {
         }
         Command::Projects { command: ProjectCommand::List { depth } } => {
             print_call("projects.list", json!({"max_depth": depth})).await
+        }
+        Command::Projects { command: ProjectCommand::SetRuntime { path, runtime, version } } => {
+            let absolute = canonical_dir(&path)?;
+            let mut params = json!({"path": absolute, "runtime": runtime});
+            if let Some(version) = version {
+                params["version"] = json!(version);
+            }
+            print_call("projects.set_runtime", params).await
+        }
+        Command::Projects { command: ProjectCommand::ClearRuntime { path } } => {
+            let absolute = canonical_dir(&path)?;
+            print_call("projects.clear_runtime", json!({"path": absolute})).await
+        }
+        Command::Runtimes { command: RuntimeCommand::List } => {
+            print_call("runtimes.list", json!({})).await
+        }
+        Command::Runtimes { command: RuntimeCommand::Install { runtime, version } } => {
+            let mut params = json!({"runtime": runtime});
+            if let Some(version) = version {
+                params["version"] = json!(version);
+            }
+            print_call("runtimes.install", params).await
+        }
+        Command::Domains { command: DomainCommand::List } => {
+            print_call("domains.list", json!({})).await
+        }
+        Command::Domains { command: DomainCommand::Secure { domain } } => {
+            print_call("domains.secure", json!({"domain": domain})).await
+        }
+        Command::Domains { command: DomainCommand::Unsecure { domain } } => {
+            print_call("domains.unsecure", json!({"domain": domain})).await
         }
         Command::Services { command: ServiceCommand::List } => {
             print_call("services.list", json!({})).await

@@ -1,11 +1,16 @@
 use anyhow::{Context, Result};
+use certs::{CA_ISSUER, certs_dir, create_leaf, leaf_exists, remove_leaf};
 use directories::ProjectDirs;
 use herd_core::{ProjectCandidate, detect_project, scan_projects};
 use herd_protocol::{PROTOCOL_VERSION, Request, Response};
+use runtimes::{
+    InstallAction, detect_runtimes, find_program, install_plan, known_runtime, known_runtime_names,
+    path_dirs,
+};
 use serde_json::{Value, json};
 use state::{
-    ServiceDef, StateError, StateStore, auto_domain, catalog_default, normalize_domain,
-    validate_service_name,
+    DomainCert, RuntimePin, ServiceDef, StateError, StateStore, auto_domain, catalog_default,
+    normalize_domain, validate_service_name,
 };
 use std::{
     fs, io,
@@ -21,6 +26,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+pub mod certs;
+pub mod runtimes;
 pub mod state;
 pub mod supervisor;
 
@@ -66,13 +73,23 @@ fn load_or_create_token() -> Result<String> {
 pub struct DaemonState {
     store: RwLock<StateStore>,
     supervisor: Mutex<Supervisor>,
+    /// The config directory (state.json, daemon.token, certs/, logs/).
+    config_dir: PathBuf,
 }
 
 impl DaemonState {
     pub fn load(dir: &std::path::Path) -> Result<Arc<Self>, StateError> {
         let store = StateStore::load(dir)?;
         let supervisor = Supervisor::new(dir.join("logs")).map_err(StateError::Io)?;
-        Ok(Arc::new(Self { store: RwLock::new(store), supervisor: Mutex::new(supervisor) }))
+        Ok(Arc::new(Self {
+            store: RwLock::new(store),
+            supervisor: Mutex::new(supervisor),
+            config_dir: dir.to_path_buf(),
+        }))
+    }
+
+    pub fn config_dir(&self) -> &Path {
+        &self.config_dir
     }
 }
 
@@ -288,55 +305,260 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
             let depth =
                 request.params.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
             let store = state.store.read().await;
-            let mut found: Vec<ProjectCandidate> = Vec::new();
-            let mut sources: Vec<(String, Option<String>, &'static str)> = Vec::new();
-            for root in &store.state.parked_paths {
-                let root_path = PathBuf::from(root);
-                if let Ok(projects) = scan_projects(&root_path, depth) {
-                    for project in projects {
-                        if found.iter().any(|p| p.path == project.path) {
-                            continue;
-                        }
-                        let (domain, source) = enrich(&project, &store);
-                        sources.push((path_string(&project.path), domain, source));
-                        found.push(project);
-                    }
-                }
-            }
-            for link in &store.state.links {
-                let link_path = PathBuf::from(&link.path);
-                if found.iter().any(|p| p.path == link_path) {
-                    continue;
-                }
-                let project = detect_project(&link_path).unwrap_or(ProjectCandidate {
-                    name: link_path
-                        .file_name()
-                        .and_then(|v| v.to_str())
-                        .unwrap_or("project")
-                        .to_string(),
-                    path: link_path.clone(),
-                    kind: "Unknown".into(),
-                    manifest: String::new(),
-                });
-                sources.push((path_string(&project.path), Some(link.domain.clone()), "Linked"));
-                found.push(project);
-            }
-            found.sort_by(|a, b| a.path.cmp(&b.path));
+            let found = known_projects(&store, depth);
             let projects: Vec<Value> = found
                 .iter()
-                .map(|p| {
-                    let (domain, source) = sources
-                        .iter()
-                        .find(|(path, _, _)| path == &path_string(&p.path))
-                        .map(|(_, domain, source)| (domain.clone(), *source))
-                        .unwrap_or((None, "Scanned"));
+                .map(|(p, domain, source)| {
+                    let runtime = store
+                        .runtime_pin(&path_string(&p.path))
+                        .map(|pin| json!({"runtime": pin.runtime, "version": pin.version}));
                     json!({
                         "name": p.name, "path": p.path, "kind": p.kind, "manifest": p.manifest,
-                        "domain": domain, "source": source,
+                        "domain": domain, "source": source, "runtime": runtime,
                     })
                 })
                 .collect();
             Response::success(request.id, json!({"projects": projects}))
+        }
+        "runtimes.list" => {
+            let runtimes = tokio::task::spawn_blocking(detect_runtimes).await.unwrap_or_default();
+            Response::success(request.id, json!({"runtimes": runtimes}))
+        }
+        "runtimes.install" => {
+            let runtime = match required_str(&request, "runtime") {
+                Ok(runtime) => runtime.to_string(),
+                Err(response) => return response,
+            };
+            let version =
+                request.params.get("version").and_then(|v| v.as_str()).map(str::to_string);
+            let rustup_present = find_program("rustup", &path_dirs()).is_some();
+            let action = match install_plan(&runtime, version.as_deref(), rustup_present) {
+                Ok(action) => action,
+                Err(message) => return internal_error(request.id, message),
+            };
+            let InstallAction::ViaRustup { toolchain } = action;
+            let installed = tokio::task::spawn_blocking(move || {
+                let output = std::process::Command::new("rustup")
+                    .args(["toolchain", "install", &toolchain])
+                    .output();
+                match output {
+                    Ok(output) if output.status.success() => Ok(()),
+                    Ok(output) => {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        Err(stderr.lines().last().unwrap_or("rustup failed").trim().to_string())
+                    }
+                    Err(error) => Err(format!("cannot run rustup: {error}")),
+                }
+            })
+            .await;
+            match installed {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => return internal_error(request.id, message),
+                Err(error) => {
+                    return internal_error(request.id, format!("install task failed: {error}"));
+                }
+            }
+            let detected = tokio::task::spawn_blocking(detect_runtimes).await.unwrap_or_default();
+            let version =
+                detected.iter().find(|r| r.name == "rust").map(|r| r.version.clone()).or(version);
+            Response::success(
+                request.id,
+                json!({"runtime": runtime, "version": version, "installed": true}),
+            )
+        }
+        "projects.set_runtime" => {
+            let path = match canonical_dir(&request, "path") {
+                Ok(path) => path,
+                Err(response) => return response,
+            };
+            let runtime = match required_str(&request, "runtime") {
+                Ok(runtime) => runtime.to_string(),
+                Err(response) => return response,
+            };
+            if known_runtime(&runtime).is_none() {
+                return invalid_params(
+                    request.id,
+                    format!(
+                        "unknown runtime {runtime:?}; known runtimes: {}",
+                        known_runtime_names().join(", ")
+                    ),
+                );
+            }
+            let version =
+                request.params.get("version").and_then(|v| v.as_str()).map(str::to_string);
+            {
+                let store = state.store.read().await;
+                let depth = 3;
+                if !known_projects(&store, depth).iter().any(|(p, _, _)| p.path == path) {
+                    return invalid_params(
+                        request.id,
+                        format!(
+                            "path {} is not a known project; park or link it first",
+                            path.display()
+                        ),
+                    );
+                }
+            }
+            if let Some(wanted) = &version {
+                let detected =
+                    tokio::task::spawn_blocking(detect_runtimes).await.unwrap_or_default();
+                match detected.iter().find(|r| r.name == runtime) {
+                    None => {
+                        return invalid_params(
+                            request.id,
+                            format!(
+                                "runtime {runtime:?} is not installed on this machine; install it first"
+                            ),
+                        );
+                    }
+                    Some(found) if found.version != *wanted => {
+                        return invalid_params(
+                            request.id,
+                            format!(
+                                "version {wanted:?} of {runtime} is not installed; installed version is {}",
+                                found.version
+                            ),
+                        );
+                    }
+                    Some(_) => {}
+                }
+            }
+            let pin = RuntimePin {
+                path: path_string(&path),
+                runtime: runtime.clone(),
+                version: version.clone(),
+            };
+            let mut store = state.store.write().await;
+            if let Err(error) = store.set_runtime_pin(pin) {
+                return state_error(request.id, error);
+            }
+            match store.save() {
+                Ok(()) => Response::success(
+                    request.id,
+                    json!({"path": path, "runtime": runtime, "version": version}),
+                ),
+                Err(error) => state_error(request.id, error),
+            }
+        }
+        "projects.clear_runtime" => {
+            let path = match canonical_dir(&request, "path") {
+                Ok(path) => path,
+                Err(response) => return response,
+            };
+            let path = path_string(&path);
+            let mut store = state.store.write().await;
+            if let Err(error) = store.clear_runtime_pin(&path) {
+                return state_error(request.id, error);
+            }
+            match store.save() {
+                Ok(()) => Response::success(request.id, json!({"path": path, "pinned": false})),
+                Err(error) => state_error(request.id, error),
+            }
+        }
+        "domains.secure" => {
+            let domain = match required_str(&request, "domain").and_then(|raw| {
+                normalize_domain(raw).map_err(|error| state_error(request.id.clone(), error))
+            }) {
+                Ok(domain) => domain,
+                Err(response) => return response,
+            };
+            {
+                let store = state.store.read().await;
+                if !known_domains(&store, 3).iter().any(|d| d == &domain) {
+                    return invalid_params(
+                        request.id,
+                        format!(
+                            "domain {domain:?} is not linked to any project; link a project first with projects.link"
+                        ),
+                    );
+                }
+            }
+            let openssl = match find_program("openssl", &path_dirs()) {
+                Some(path) => path,
+                None => {
+                    return internal_error(
+                        request.id,
+                        "openssl is not installed; install openssl to create local certificates",
+                    );
+                }
+            };
+            let certs = certs_dir(state.config_dir());
+            let domain_for_task = domain.clone();
+            let created = tokio::task::spawn_blocking(move || {
+                create_leaf(&certs, &domain_for_task, &openssl)
+            })
+            .await;
+            let expires_at = match created {
+                Ok(Ok(expires_at)) => expires_at,
+                Ok(Err(message)) => return internal_error(request.id, message),
+                Err(error) => {
+                    return internal_error(request.id, format!("certificate task failed: {error}"));
+                }
+            };
+            let record = DomainCert {
+                domain: domain.clone(),
+                cert_file: format!("{domain}.crt"),
+                key_file: format!("{domain}.key"),
+                created_at: unix_secs(SystemTime::now()),
+                expires_at,
+                issuer: CA_ISSUER.to_string(),
+            };
+            let mut store = state.store.write().await;
+            store.upsert_domain(record);
+            match store.save() {
+                Ok(()) => Response::success(
+                    request.id,
+                    json!({"domain": domain, "secured": true, "expires_at": expires_at, "issuer": CA_ISSUER}),
+                ),
+                Err(error) => state_error(request.id, error),
+            }
+        }
+        "domains.unsecure" => {
+            let domain = match required_str(&request, "domain").and_then(|raw| {
+                normalize_domain(raw).map_err(|error| state_error(request.id.clone(), error))
+            }) {
+                Ok(domain) => domain,
+                Err(response) => return response,
+            };
+            let certs = certs_dir(state.config_dir());
+            let mut store = state.store.write().await;
+            if let Err(error) = store.remove_domain(&domain) {
+                return state_error(request.id, error);
+            }
+            if let Err(error) = store.save() {
+                return state_error(request.id, error);
+            }
+            let _ = remove_leaf(&certs, &domain);
+            Response::success(request.id, json!({"domain": domain, "secured": false}))
+        }
+        "domains.list" => {
+            let store = state.store.read().await;
+            let certs = certs_dir(state.config_dir());
+            let known = known_projects(&store, 3);
+            let mut domains: Vec<(String, String)> = Vec::new();
+            for (project, domain, _) in &known {
+                if let Some(domain) = domain {
+                    let entry = (domain.clone(), path_string(&project.path));
+                    if !domains.contains(&entry) {
+                        domains.push(entry);
+                    }
+                }
+            }
+            domains.sort();
+            let out: Vec<Value> = domains
+                .iter()
+                .map(|(domain, project)| {
+                    let record = store.domain_cert(domain);
+                    let secured = record.is_some_and(|_| leaf_exists(&certs, domain));
+                    json!({
+                        "domain": domain, "project": project,
+                        "secured": secured,
+                        "expires_at": if secured { record.map(|r| r.expires_at) } else { None },
+                        "issuer": if secured { record.map(|r| r.issuer.clone()) } else { None },
+                    })
+                })
+                .collect();
+            Response::success(request.id, json!({"domains": out}))
         }
         "services.list" => {
             let defs = {
@@ -504,6 +726,59 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
         }
         _ => Response::error(request.id, -32601, "method not found"),
     }
+}
+
+/// All projects the daemon knows about: every project found by
+/// scanning the parked paths, plus every linked project. Each entry
+/// carries its domain (when linked, or auto-derived when parked) and
+/// its source. Shared by `projects.list`, the G2 pin validation, and
+/// the G3 known-domain check, so the three can never disagree about
+/// what "known" means.
+fn known_projects(
+    store: &StateStore,
+    depth: usize,
+) -> Vec<(ProjectCandidate, Option<String>, &'static str)> {
+    let mut found: Vec<PathBuf> = Vec::new();
+    let mut enriched: Vec<(ProjectCandidate, Option<String>, &'static str)> = Vec::new();
+    for root in &store.state.parked_paths {
+        let root_path = PathBuf::from(root);
+        if let Ok(projects) = scan_projects(&root_path, depth) {
+            for project in projects {
+                if found.contains(&project.path) {
+                    continue;
+                }
+                let (domain, source) = enrich(&project, store);
+                found.push(project.path.clone());
+                enriched.push((project, domain, source));
+            }
+        }
+    }
+    for link in &store.state.links {
+        let link_path = PathBuf::from(&link.path);
+        if found.contains(&link_path) {
+            continue;
+        }
+        let project = detect_project(&link_path).unwrap_or(ProjectCandidate {
+            name: link_path.file_name().and_then(|v| v.to_str()).unwrap_or("project").to_string(),
+            path: link_path.clone(),
+            kind: "Unknown".into(),
+            manifest: String::new(),
+        });
+        found.push(link_path);
+        enriched.push((project, Some(link.domain.clone()), "Linked"));
+    }
+    enriched.sort_by(|a, b| a.0.path.cmp(&b.0.path));
+    enriched
+}
+
+/// Every domain the daemon knows about: linked domains plus the
+/// auto-domains of parked projects.
+fn known_domains(store: &StateStore, depth: usize) -> Vec<String> {
+    let mut domains: Vec<String> =
+        known_projects(store, depth).into_iter().filter_map(|(_, domain, _)| domain).collect();
+    domains.sort();
+    domains.dedup();
+    domains
 }
 
 /// Domain and source for a scanned project: an exact link wins, then a
