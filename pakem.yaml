@@ -1,0 +1,9 @@
+# Herd pins Pakem v1.2. Commands are the project's own, Pakem never guesses them.
+# UI checks (npm run build in apps/desktop/ui) run in .github/workflows/frontend.yml.
+pakem:
+  version: "1.2.0"
+checks:
+  test: cargo test --workspace
+  lint: cargo clippy --workspace --all-targets -- -D warnings
+  format: cargo fmt --check
+  build: cargo build
