@@ -34,7 +34,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          projectPath: apps/desktop/src-tauri
+          projectPath: apps/desktop
           tauriScript: npx --yes @tauri-apps/cli@2
       - name: Upload MSI
         uses: actions/upload-artifact@v4
