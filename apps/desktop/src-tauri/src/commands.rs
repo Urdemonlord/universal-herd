@@ -95,8 +95,9 @@ pub async fn stop_service(name: String) -> Result<Value, String> {
 ///
 /// There is no standalone `herd-daemon` binary in this repo: the
 /// daemon runs as `herd daemon` (CLI binary). So look for `herd-daemon`
-/// first (a future standalone binary), then `herd` on PATH, then the
-/// CLI build output of this workspace.
+/// first (a future standalone binary), then `herd` on PATH, then beside
+/// the running executable (the installed app ships the CLI as a Tauri
+/// sidecar there), then the CLI build output of this workspace.
 fn find_daemon_binary() -> Option<(PathBuf, Option<&'static str>)> {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     for dir in std::env::split_paths(&path_var) {
@@ -104,6 +105,16 @@ fn find_daemon_binary() -> Option<(PathBuf, Option<&'static str>)> {
             let candidate = dir.join(name);
             if candidate.is_file() {
                 return Some((candidate, arg));
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for (name, arg) in [("herd-daemon", None), ("herd", Some("daemon"))] {
+                let candidate = dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+                if candidate.is_file() {
+                    return Some((candidate, arg));
+                }
             }
         }
     }

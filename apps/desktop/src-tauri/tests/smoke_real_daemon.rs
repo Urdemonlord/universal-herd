@@ -61,7 +61,7 @@ async fn desktop_commands_against_real_daemon() {
     assert_eq!(started["started"], true, "{started}");
     let pid = started["pid"].as_u64().expect("start_daemon returned no pid");
     let status = daemon_status().await.expect("daemon did not answer after start");
-    assert_eq!(status["protocol"], "1.3");
+    assert_eq!(status["protocol"], "1.4");
     assert_eq!(status["status"], "running");
 
     // Scan finds the throwaway project. A bare scan does not put the
