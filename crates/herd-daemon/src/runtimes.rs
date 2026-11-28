@@ -76,6 +76,16 @@ pub fn find_program(name: &str, search_dirs: &[PathBuf]) -> Option<PathBuf> {
         if candidate.is_file() {
             return Some(candidate);
         }
+        // Windows binaries carry a `.exe` suffix, so `node` on disk
+        // is `node.exe`; without this lookup no runtime is ever
+        // detected on Windows.
+        #[cfg(windows)]
+        {
+            let exe_candidate = dir.join(format!("{name}.exe"));
+            if exe_candidate.is_file() {
+                return Some(exe_candidate);
+            }
+        }
     }
     None
 }
@@ -276,9 +286,11 @@ pub fn manual_install_hint(runtime: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::fs;
 
+    #[cfg(unix)]
     fn fake_bin_dir(tag: &str, bins: &[(&str, &str)]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("herd-runtime-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -317,6 +329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn detection_runs_fake_binaries_and_skips_missing_ones() {
         let dir = fake_bin_dir(
             "detect",
@@ -340,6 +353,33 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn find_program_finds_exe_suffix_on_windows() {
+        let dir =
+            std::env::temp_dir().join(format!("herd-runtime-test-exe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("node.exe"), "fake").unwrap();
+        assert_eq!(find_program("node", std::slice::from_ref(&dir)), Some(dir.join("node.exe")));
+        // An exact match still wins over the `.exe` fallback.
+        fs::write(dir.join("node"), "fake").unwrap();
+        assert_eq!(find_program("node", std::slice::from_ref(&dir)), Some(dir.join("node")));
+        assert!(find_program("missing", std::slice::from_ref(&dir)).is_none());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn detection_skips_missing_binaries_on_windows() {
+        let dir =
+            std::env::temp_dir().join(format!("herd-runtime-test-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(detect_runtimes_in(std::slice::from_ref(&dir)).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn installed_version_reporting_prefers_the_request() {
         // A requested version is reported as-is, even when a query
         // would find something else (RUSTUP_TOOLCHAIN override).
@@ -354,7 +394,9 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn toolchain_version_query_uses_the_named_toolchain() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir()
             .join(format!("herd-runtime-test-rustup-query-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -377,6 +419,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn hanging_version_probe_is_killed_and_reaped() {
+        use std::os::unix::fs::PermissionsExt;
         let dir =
             std::env::temp_dir().join(format!("herd-runtime-test-hang-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
