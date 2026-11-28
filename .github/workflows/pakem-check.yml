@@ -1,0 +1,44 @@
+# pakem-check.yml - run the checks the project declares in its own pakem.yaml.
+#
+# Copy this file to .github/workflows/pakem-check.yml and copy
+# scripts/pakem-check.sh to scripts/pakem-check.sh in the same repo.
+# The workflow runs the same script local runs use, so CI and local
+# report the same result.
+#
+# Pakem never guesses project commands. The commands come from the
+# project's pakem.yaml, for example:
+#
+#   pakem:
+#     version: "1.2.0"
+#   checks:
+#     test: cargo test --workspace
+#     lint: cargo clippy -- -D warnings
+#     format: cargo fmt --check
+#     build: cargo build
+#
+# A project without a valid pakem.yaml fails with a message that
+# explains the format, not with a guessed command.
+
+name: pakem-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  pakem-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python (for reading pakem.yaml)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: python3 -m pip install pyyaml
+
+      - name: Run pakem-check
+        run: bash scripts/pakem-check.sh .
