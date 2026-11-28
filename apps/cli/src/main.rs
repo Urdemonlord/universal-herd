@@ -42,6 +42,11 @@ enum Command {
         #[command(subcommand)]
         command: DomainCommand,
     },
+    /// Serve linked domains over HTTP on port 80 (protocol 1.3).
+    Proxy {
+        #[command(subcommand)]
+        command: ProxyCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -98,6 +103,24 @@ enum DomainCommand {
     Secure { domain: String },
     /// Delete a domain's certificate.
     Unsecure { domain: String },
+}
+
+#[derive(Subcommand)]
+enum ProxyCommand {
+    /// Start the HTTP proxy on 127.0.0.1 (default port 80).
+    Start {
+        /// Listen port. Defaults to 80; a different port is only a
+        /// test/dev escape hatch, since browsers reach `.test`
+        /// domains on port 80.
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Stop the running HTTP proxy.
+    Stop,
+    /// Show whether the HTTP proxy is running and on which port.
+    Status,
+    /// List the routes computed from links, services, and docroots.
+    Routes,
 }
 
 #[derive(Subcommand)]
@@ -203,6 +226,20 @@ async fn main() -> Result<()> {
         }
         Command::Domains { command: DomainCommand::Unsecure { domain } } => {
             print_call("domains.unsecure", json!({"domain": domain})).await
+        }
+        Command::Proxy { command: ProxyCommand::Start { port } } => {
+            let mut params = json!({});
+            if let Some(port) = port {
+                params["port"] = json!(port);
+            }
+            print_call("proxy.start", params).await
+        }
+        Command::Proxy { command: ProxyCommand::Stop } => print_call("proxy.stop", json!({})).await,
+        Command::Proxy { command: ProxyCommand::Status } => {
+            print_call("proxy.status", json!({})).await
+        }
+        Command::Proxy { command: ProxyCommand::Routes } => {
+            print_call("proxy.routes", json!({})).await
         }
         Command::Services { command: ServiceCommand::List } => {
             print_call("services.list", json!({})).await

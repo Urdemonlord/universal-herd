@@ -86,7 +86,7 @@ async fn g2_runtime_pin_and_g3_local_https() {
     let mut client = Client::connect(port).await;
 
     let status = client.ok("system.status", json!({})).await;
-    assert_eq!(status["protocol"], "1.2");
+    assert_eq!(status["protocol"], "1.3");
 
     // G2: runtimes.list reports the real runtimes on this machine.
     let listed = client.ok("runtimes.list", json!({})).await;

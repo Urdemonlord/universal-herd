@@ -3,6 +3,7 @@ use certs::{CA_ISSUER, certs_dir, create_leaf, leaf_exists, remove_leaf};
 use directories::ProjectDirs;
 use herd_core::{ProjectCandidate, detect_project, scan_projects};
 use herd_protocol::{PROTOCOL_VERSION, Request, Response};
+use proxy::ProxyHandle;
 use runtimes::{
     InstallAction, detect_runtimes, find_program, install_plan, known_runtime, known_runtime_names,
     path_dirs, query_toolchain_version, report_installed_version,
@@ -27,6 +28,7 @@ use tokio::{
 use tracing::{info, warn};
 
 pub mod certs;
+pub mod proxy;
 pub mod runtimes;
 pub mod state;
 pub mod supervisor;
@@ -81,6 +83,11 @@ pub struct DaemonState {
     /// Held across the whole blocking certificate call, and by
     /// `domains.unsecure` while it deletes the leaf files.
     certs: Mutex<()>,
+    /// The running HTTP proxy (PR-1), if `proxy.start` was called.
+    /// Only the proxy handlers touch this slot; the HTTP request
+    /// handler never locks it, so it cannot deadlock against the
+    /// store/supervisor locks.
+    proxy: Mutex<Option<ProxyHandle>>,
 }
 
 impl DaemonState {
@@ -92,6 +99,7 @@ impl DaemonState {
             supervisor: Mutex::new(supervisor),
             config_dir: dir.to_path_buf(),
             certs: Mutex::new(()),
+            proxy: Mutex::new(None),
         }))
     }
 
@@ -140,7 +148,7 @@ async fn handle_client(stream: TcpStream, token: String, state: Arc<DaemonState>
     while reader.read_line(&mut line).await? > 0 {
         let response = match serde_json::from_str::<Request>(&line) {
             Ok(request) if request.token.as_deref() == Some(token.as_str()) => {
-                dispatch(request, &state).await
+                dispatch(request, Arc::clone(&state)).await
             }
             Ok(request) => Response::error(request.id, -32001, "unauthorized"),
             Err(error) => {
@@ -195,16 +203,12 @@ fn canonical_dir(request: &Request, field: &str) -> Result<PathBuf, Response> {
     Ok(path)
 }
 
-/// Resolve a path naming a stored registration (unpark/unlink):
-/// canonicalize when the directory still exists, otherwise absolutize
-/// lexically (relative to the current directory) without touching the
-/// filesystem, so a deleted directory can still be unregistered.
-/// A symlinked path whose target is gone will not match the stored
-/// canonical path; that case still reports "not parked/linked".
-pub fn stored_dir(raw: &Path) -> PathBuf {
-    if let Ok(canonical) = fs::canonicalize(raw) {
-        return canonical;
-    }
+/// Lexically absolutize and normalize a path without touching the
+/// filesystem: `.` segments are dropped, `..` pops the previous
+/// segment. Used for comparing stored paths whose spelling may
+/// differ (`/srv/web/.` vs `/srv/web`); see `stored_dir` and the
+/// proxy route computation.
+pub fn lexical_normalize(raw: &Path) -> PathBuf {
     let absolute = if raw.is_absolute() {
         raw.to_path_buf()
     } else {
@@ -223,6 +227,19 @@ pub fn stored_dir(raw: &Path) -> PathBuf {
     out
 }
 
+/// Resolve a path naming a stored registration (unpark/unlink):
+/// canonicalize when the directory still exists, otherwise absolutize
+/// lexically (relative to the current directory) without touching the
+/// filesystem, so a deleted directory can still be unregistered.
+/// A symlinked path whose target is gone will not match the stored
+/// canonical path; that case still reports "not parked/linked".
+pub fn stored_dir(raw: &Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(raw) {
+        return canonical;
+    }
+    lexical_normalize(raw)
+}
+
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
@@ -232,7 +249,7 @@ fn unix_secs(time: SystemTime) -> u64 {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn dispatch(request: Request, state: &DaemonState) -> Response {
+async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
     if request.jsonrpc != "2.0" {
         return Response::error(request.id, -32600, "invalid JSON-RPC version");
     }
@@ -666,7 +683,10 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
                             format!("params.workdir is not a directory: {dir}"),
                         );
                     }
-                    Some(path_string(&path))
+                    // Canonicalize at the boundary, like `projects.link`:
+                    // a spelling such as `/srv/web/.` must match the
+                    // linked project `/srv/web` in route computation.
+                    Some(path_string(&stored_dir(&path)))
                 }
                 None => None,
             };
@@ -763,6 +783,70 @@ async fn dispatch(request: Request, state: &DaemonState) -> Response {
             match supervisor.logs(&name, lines) {
                 Ok(lines) => Response::success(request.id, json!({"name": name, "lines": lines})),
                 Err(error) => internal_error(request.id, format!("cannot read logs: {error}")),
+            }
+        }
+        "proxy.routes" => {
+            let routes = proxy::current_routes(&state).await;
+            Response::success(request.id, json!({"routes": routes}))
+        }
+        "proxy.start" => {
+            let port = match request.params.get("port") {
+                Some(Value::Null) | None => proxy::DEFAULT_PROXY_PORT,
+                Some(value) => match value.as_u64() {
+                    Some(port) if (1..=65535).contains(&port) => port as u16,
+                    _ => return invalid_params(request.id, "params.port must be 1-65535"),
+                },
+            };
+            let mut slot = state.proxy.lock().await;
+            if let Some(handle) = slot.as_ref() {
+                if handle.is_terminated() {
+                    // The listener gave up after repeated accept
+                    // errors: reap the dead handle so a fresh proxy
+                    // can start instead of refusing forever.
+                    let old = slot.take().unwrap();
+                    old.stop().await;
+                } else {
+                    return internal_error(
+                        request.id,
+                        "proxy is already running; stop it first with proxy.stop",
+                    );
+                }
+            }
+            match proxy::start_proxy(Arc::clone(&state), port).await {
+                Ok(handle) => {
+                    let started_at = unix_secs(handle.started_at);
+                    *slot = Some(handle);
+                    Response::success(
+                        request.id,
+                        json!({"running": true, "port": port, "started_at": started_at}),
+                    )
+                }
+                Err(message) => internal_error(request.id, message),
+            }
+        }
+        "proxy.stop" => {
+            let mut slot = state.proxy.lock().await;
+            let Some(handle) = slot.take() else {
+                return invalid_params(request.id, "proxy is not running");
+            };
+            let port = handle.port;
+            handle.stop().await;
+            Response::success(request.id, json!({"running": false, "port": port}))
+        }
+        "proxy.status" => {
+            let slot = state.proxy.lock().await;
+            match slot.as_ref() {
+                // A terminated listener is reported as not running:
+                // the old code kept reporting running: true after the
+                // accept loop had died.
+                Some(handle) if !handle.is_terminated() => Response::success(
+                    request.id,
+                    json!({"running": true, "port": handle.port, "started_at": unix_secs(handle.started_at)}),
+                ),
+                _ => Response::success(
+                    request.id,
+                    json!({"running": false, "port": null, "started_at": null}),
+                ),
             }
         }
         _ => Response::error(request.id, -32601, "method not found"),
