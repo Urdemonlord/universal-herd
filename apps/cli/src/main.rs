@@ -47,6 +47,13 @@ enum Command {
         #[command(subcommand)]
         command: ProxyCommand,
     },
+    /// Serve linked domains over DNS on port 53 (protocol 1.4).
+    Dns {
+        #[command(subcommand)]
+        command: DnsCommand,
+    },
+    /// Check the DNS, proxy, and CA layers and report each one.
+    Doctor,
 }
 
 #[derive(Subcommand)]
@@ -121,6 +128,39 @@ enum ProxyCommand {
     Status,
     /// List the routes computed from links, services, and docroots.
     Routes,
+}
+
+#[derive(Subcommand)]
+enum DnsCommand {
+    /// Start the DNS server on 127.0.0.1 (default port 53).
+    /// Answers linked `.test` names with 127.0.0.1 and forwards
+    /// everything else to the system resolver.
+    Start {
+        /// Listen port. Defaults to 53; a different port is only a
+        /// test/dev escape hatch, since resolvers query port 53.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Upstream resolver IP for non-`.test` queries. Defaults
+        /// to the first nameserver in /etc/resolv.conf.
+        #[arg(long)]
+        upstream: Option<String>,
+        /// Upstream resolver port. Defaults to 53; a different port
+        /// is only a test escape hatch for a fake upstream.
+        #[arg(long)]
+        upstream_port: Option<u16>,
+    },
+    /// Stop the running DNS server.
+    Stop,
+    /// Show whether the DNS server is running, on which port, and
+    /// how many linked domains it answers.
+    Status,
+    /// Register the OS resolver so `*.test` reaches this daemon.
+    /// Needs privilege (root/sudo on Linux and macOS, elevated
+    /// PowerShell on Windows); as a normal user it fails with the
+    /// exact privileged command to run instead.
+    Install,
+    /// Remove the OS resolver registration.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -241,6 +281,26 @@ async fn main() -> Result<()> {
         Command::Proxy { command: ProxyCommand::Routes } => {
             print_call("proxy.routes", json!({})).await
         }
+        Command::Dns { command: DnsCommand::Start { port, upstream, upstream_port } } => {
+            let mut params = json!({});
+            if let Some(port) = port {
+                params["port"] = json!(port);
+            }
+            if let Some(upstream) = upstream {
+                params["upstream"] = json!(upstream);
+            }
+            if let Some(upstream_port) = upstream_port {
+                params["upstream_port"] = json!(upstream_port);
+            }
+            print_call("dns.start", params).await
+        }
+        Command::Dns { command: DnsCommand::Stop } => print_call("dns.stop", json!({})).await,
+        Command::Dns { command: DnsCommand::Status } => print_call("dns.status", json!({})).await,
+        Command::Dns { command: DnsCommand::Install } => print_call("dns.install", json!({})).await,
+        Command::Dns { command: DnsCommand::Uninstall } => {
+            print_call("dns.uninstall", json!({})).await
+        }
+        Command::Doctor => print_call("system.doctor", json!({})).await,
         Command::Services { command: ServiceCommand::List } => {
             print_call("services.list", json!({})).await
         }

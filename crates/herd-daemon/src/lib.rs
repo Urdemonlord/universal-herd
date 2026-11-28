@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use certs::{CA_ISSUER, certs_dir, create_leaf, leaf_exists, remove_leaf};
 use directories::ProjectDirs;
+use dns::DnsHandle;
 use herd_core::{ProjectCandidate, detect_project, scan_projects};
 use herd_protocol::{PROTOCOL_VERSION, Request, Response};
 use proxy::ProxyHandle;
@@ -28,6 +29,7 @@ use tokio::{
 use tracing::{info, warn};
 
 pub mod certs;
+pub mod dns;
 pub mod proxy;
 pub mod runtimes;
 pub mod state;
@@ -88,6 +90,9 @@ pub struct DaemonState {
     /// handler never locks it, so it cannot deadlock against the
     /// store/supervisor locks.
     proxy: Mutex<Option<ProxyHandle>>,
+    /// The running DNS server (PR-2), if `dns.start` was called.
+    /// Same ownership rule as the proxy slot.
+    dns: Mutex<Option<DnsHandle>>,
 }
 
 impl DaemonState {
@@ -100,6 +105,7 @@ impl DaemonState {
             config_dir: dir.to_path_buf(),
             certs: Mutex::new(()),
             proxy: Mutex::new(None),
+            dns: Mutex::new(None),
         }))
     }
 
@@ -848,6 +854,123 @@ async fn dispatch(request: Request, state: Arc<DaemonState>) -> Response {
                     json!({"running": false, "port": null, "started_at": null}),
                 ),
             }
+        }
+        "dns.start" => {
+            let port = match request.params.get("port") {
+                Some(Value::Null) | None => dns::DEFAULT_DNS_PORT,
+                Some(value) => match value.as_u64() {
+                    Some(port) if (1..=65535).contains(&port) => port as u16,
+                    _ => return invalid_params(request.id, "params.port must be 1-65535"),
+                },
+            };
+            let upstream = match request.params.get("upstream") {
+                Some(Value::Null) | None => match dns::system_upstream() {
+                    Some(upstream) => upstream,
+                    None => {
+                        return internal_error(
+                            request.id,
+                            "cannot determine the system DNS resolver from /etc/resolv.conf; pass params.upstream explicitly, e.g. your router address or 8.8.8.8",
+                        );
+                    }
+                },
+                Some(value) => {
+                    match value.as_str().and_then(|text| text.parse::<std::net::IpAddr>().ok()) {
+                        Some(upstream) => upstream,
+                        None => {
+                            return invalid_params(
+                                request.id,
+                                "params.upstream must be an IP address",
+                            );
+                        }
+                    }
+                }
+            };
+            let upstream_port = match request.params.get("upstream_port") {
+                Some(Value::Null) | None => 53,
+                Some(value) => match value.as_u64() {
+                    Some(port) if (1..=65535).contains(&port) => port as u16,
+                    _ => {
+                        return invalid_params(request.id, "params.upstream_port must be 1-65535");
+                    }
+                },
+            };
+            let mut slot = state.dns.lock().await;
+            if let Some(handle) = slot.as_ref() {
+                if handle.is_finished() {
+                    // The server task died on its own: reap the dead
+                    // handle so a fresh DNS server can start.
+                    let old = slot.take().unwrap();
+                    old.stop().await;
+                } else {
+                    return internal_error(
+                        request.id,
+                        "dns is already running; stop it first with dns.stop",
+                    );
+                }
+            }
+            match dns::start_dns(Arc::clone(&state), port, upstream, upstream_port).await {
+                Ok(handle) => {
+                    let started_at = unix_secs(handle.started_at);
+                    let answer = json!({
+                        "running": true, "port": port, "started_at": started_at,
+                        "upstream": upstream.to_string(), "upstream_port": upstream_port,
+                    });
+                    *slot = Some(handle);
+                    Response::success(request.id, answer)
+                }
+                Err(message) => internal_error(request.id, message),
+            }
+        }
+        "dns.stop" => {
+            let mut slot = state.dns.lock().await;
+            let Some(handle) = slot.take() else {
+                return invalid_params(request.id, "dns is not running");
+            };
+            let port = handle.port;
+            handle.stop().await;
+            Response::success(request.id, json!({"running": false, "port": port}))
+        }
+        "dns.status" => {
+            let domains = dns::answered_domains(&state).await.len();
+            let slot = state.dns.lock().await;
+            match slot.as_ref() {
+                Some(handle) if !handle.is_finished() => Response::success(
+                    request.id,
+                    json!({
+                        "running": true, "port": handle.port,
+                        "started_at": unix_secs(handle.started_at),
+                        "upstream": handle.upstream.to_string(),
+                        "upstream_port": handle.upstream_port, "domains": domains,
+                    }),
+                ),
+                _ => Response::success(
+                    request.id,
+                    json!({
+                        "running": false, "port": null, "started_at": null,
+                        "upstream": null, "upstream_port": null, "domains": domains,
+                    }),
+                ),
+            }
+        }
+        "dns.install" => match tokio::task::spawn_blocking(dns::install_resolver).await {
+            Ok(Ok((method, detail))) => Response::success(
+                request.id,
+                json!({"installed": true, "method": method.as_str(), "detail": detail}),
+            ),
+            Ok(Err(message)) => internal_error(request.id, message),
+            Err(error) => internal_error(request.id, format!("install task failed: {error}")),
+        },
+        "dns.uninstall" => match tokio::task::spawn_blocking(dns::uninstall_resolver).await {
+            Ok(Ok((method, detail))) => Response::success(
+                request.id,
+                json!({"installed": false, "method": method.as_str(), "detail": detail}),
+            ),
+            Ok(Err(message)) => internal_error(request.id, message),
+            Err(error) => internal_error(request.id, format!("uninstall task failed: {error}")),
+        },
+        "system.doctor" => {
+            let report = dns::doctor_report(&state).await;
+            Response::success(request.id, report)
         }
         _ => Response::error(request.id, -32601, "method not found"),
     }

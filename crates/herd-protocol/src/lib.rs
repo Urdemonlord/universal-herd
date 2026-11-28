@@ -3,10 +3,10 @@ use serde_json::Value;
 
 /// Protocol version. Bumped 1.0 -> 1.1 when the G1 (park/link) and G4
 /// (services) methods were added, 1.1 -> 1.2 for the G2 (isolate) and
-/// G3 (secure) methods, and 1.2 -> 1.3 for the PR-1 proxy methods;
-/// see BSD: method or field changes must raise the protocol version,
-/// not just the app version.
-pub const PROTOCOL_VERSION: &str = "1.3";
+/// G3 (secure) methods, 1.2 -> 1.3 for the PR-1 proxy methods, and
+/// 1.3 -> 1.4 for the PR-2 DNS methods; see BSD: method or field
+/// changes must raise the protocol version, not just the app version.
+pub const PROTOCOL_VERSION: &str = "1.4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
