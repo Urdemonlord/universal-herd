@@ -1002,11 +1002,11 @@ mod tests {
         let real = link_base.join("real");
         let target = real.join("proj");
         fs::create_dir_all(&target).unwrap();
-        let target_canonical = fs::canonicalize(&target).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, link_base.join("link")).unwrap();
         #[cfg(unix)]
         {
+            let target_canonical = fs::canonicalize(&target).unwrap();
             let via_link = link_base.join("link").join("proj");
             assert_eq!(stored_dir(&via_link), target_canonical);
             fs::remove_dir_all(&target).unwrap();
