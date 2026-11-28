@@ -92,7 +92,7 @@ async fn g1_park_link_list_and_g4_service_lifecycle() {
 
     // Old methods still behave.
     let status = client.ok("system.status", json!({})).await;
-    assert_eq!(status["protocol"], "1.3");
+    assert_eq!(status["protocol"], "1.4");
     assert_eq!(status["status"], "running");
 
     // G1: park, link, list.

@@ -185,7 +185,7 @@ async fn proxy_http_routes_start_stop_and_serve() {
     let mut client = Client::connect(port).await;
 
     let status = client.ok("system.status", json!({})).await;
-    assert_eq!(status["protocol"], "1.3");
+    assert_eq!(status["protocol"], "1.4");
 
     // Proxy starts stopped; stopping a stopped proxy is -32602.
     let proxy_status = client.ok("proxy.status", json!({})).await;
