@@ -219,5 +219,13 @@ herd domains unsecure <domain>
   binary-nya (sandbox hanya punya node, npm, python3, rust).
 - Secure tanpa openssl (jalur error-nya ada di integration test
   tapi tidak tereksekusi di sandbox karena openssl ada).
-- macOS/Windows (process spawn dan mode file 0600 baru
+- macOS (process spawn dan mode file 0600 baru
   terverifikasi di Linux).
+- Windows: `cargo check --workspace --all-targets --target
+  x86_64-pc-windows-msvc` hijau di sandbox (kode Unix-only di-cfg-gate,
+  `find_program` juga mencoba suffix `.exe`, mode 0600 di-skip karena
+  Windows tidak punya permission bit Unix). Tes fake-binary dan
+  group kill hanya jalan di Unix (`#[cfg(unix)]`); tes Windows
+  membuktikan stop membunuh anak langsung dan deteksi melewati
+  binary yang tidak ada. CI Windows dan macOS yang sebenarnya tetap
+  belum hijau saat dokumen ini ditulis (PR #10).

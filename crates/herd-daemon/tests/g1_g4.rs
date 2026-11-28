@@ -16,6 +16,26 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+/// `python3` on Unix, `python.exe` on Windows: windows-latest ships
+/// Python, but the binary is `python.exe`, not `python3`.
+#[cfg(unix)]
+const PYTHON: &str = "python3";
+#[cfg(windows)]
+const PYTHON: &str = "python.exe";
+
+/// A service that prints one line then sleeps: `sh -c` on Unix,
+/// PowerShell in-process sleep on Windows (no grandchild left
+/// behind, unlike `cmd /c ping`).
+#[cfg(unix)]
+const LOGGER_CMD: &str = "sh";
+#[cfg(unix)]
+const LOGGER_ARGS: &[&str] = &["-c", "echo herd-log-line; sleep 60"];
+#[cfg(windows)]
+const LOGGER_CMD: &str = "powershell.exe";
+#[cfg(windows)]
+const LOGGER_ARGS: &[&str] =
+    &["-NoProfile", "-Command", "echo herd-log-line; Start-Sleep -Seconds 60"];
+
 struct Client {
     stream: tokio::net::tcp::OwnedWriteHalf,
     reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
@@ -156,7 +176,7 @@ async fn g1_park_link_list_and_g4_service_lifecycle() {
     let web = client
         .ok(
             "services.create",
-            json!({"name": "websvc", "command": "python3", "args": ["-m", "http.server", port.to_string()], "port": port}),
+            json!({"name": "websvc", "command": PYTHON, "args": ["-m", "http.server", port.to_string()], "port": port}),
         )
         .await;
     assert_eq!(web["port"], port);
@@ -185,14 +205,23 @@ async fn g1_park_link_list_and_g4_service_lifecycle() {
     client
         .ok(
             "services.create",
-            json!({"name": "logger", "command": "sh", "args": ["-c", "echo herd-log-line; sleep 60"]}),
+            json!({"name": "logger", "command": LOGGER_CMD, "args": LOGGER_ARGS}),
         )
         .await;
     client.ok("services.start", json!({"name": "logger"})).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let logs = client.ok("services.logs", json!({"name": "logger", "lines": 10})).await;
-    let lines = logs["lines"].as_array().unwrap();
-    assert!(lines.iter().any(|line| line.as_str().unwrap().contains("herd-log-line")), "{lines:?}");
+    // Poll for the line instead of a fixed delay: PowerShell on
+    // Windows takes a moment to start, longer than the old 300 ms.
+    let mut found = false;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let logs = client.ok("services.logs", json!({"name": "logger", "lines": 10})).await;
+        let lines = logs["lines"].as_array().unwrap();
+        if lines.iter().any(|line| line.as_str().unwrap().contains("herd-log-line")) {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "logger never printed herd-log-line");
 
     // Stop everything, remove, unlink, unpark, list is empty again.
     let stopped = client.ok("services.stop", json!({"name": "websvc"})).await;
@@ -291,7 +320,7 @@ async fn start_remove_race_leaves_no_orphan() {
         client
             .ok(
                 "services.create",
-                json!({"name": name, "command": "python3", "args": ["-m", "http.server", svc_port.to_string()], "port": svc_port}),
+                json!({"name": name, "command": PYTHON, "args": ["-m", "http.server", svc_port.to_string()], "port": svc_port}),
             )
             .await;
         // Two connections racing: one starts, one removes.

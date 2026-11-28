@@ -17,6 +17,13 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 
+/// `python3` on Unix, `python.exe` on Windows: windows-latest ships
+/// Python, but the binary is `python.exe`, not `python3`.
+#[cfg(unix)]
+const PYTHON: &str = "python3";
+#[cfg(windows)]
+const PYTHON: &str = "python.exe";
+
 struct Client {
     stream: tokio::net::tcp::OwnedWriteHalf,
     reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
@@ -219,7 +226,7 @@ async fn proxy_http_routes_start_stop_and_serve() {
             "services.create",
             json!({
                 "name": "api",
-                "command": "python3",
+                "command": PYTHON,
                 "args": ["upstream.py", upstream_port.to_string()],
                 "port": upstream_port,
                 "workdir": api,
@@ -340,7 +347,7 @@ async fn proxy_http_routes_start_stop_and_serve() {
             "services.create",
             json!({
                 "name": "dotsvc",
-                "command": "python3",
+                "command": PYTHON,
                 "args": ["upstream.py"],
                 "port": free_port().await,
                 "workdir": format!("{}/.", blog.to_str().unwrap()),

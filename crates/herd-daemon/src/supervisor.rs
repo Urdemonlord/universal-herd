@@ -26,6 +26,7 @@ use tokio::{
     time::timeout,
 };
 
+#[cfg(unix)]
 const STOP_GRACE: Duration = Duration::from_secs(3);
 
 struct RunningEntry {
@@ -360,17 +361,14 @@ fn is_executable(path: &Path) -> bool {
     let Ok(metadata) = fs::metadata(path) else {
         return false;
     };
-    if !metadata.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     {
-        true
+        metadata.is_file()
     }
 }
 
@@ -396,12 +394,39 @@ mod tests {
         }
     }
 
+    /// A command that sleeps for a while without doing anything:
+    /// `sleep` on Unix, `ping.exe` on Windows (there is no `sleep`
+    /// binary there, and `ping.exe` is the direct child, so `stop`
+    /// kills it without leaving a grandchild behind).
+    #[cfg(unix)]
+    fn sleeper_command() -> (&'static str, Vec<&'static str>) {
+        ("sleep", vec!["300"])
+    }
+
+    #[cfg(windows)]
+    fn sleeper_command() -> (&'static str, Vec<&'static str>) {
+        ("ping.exe", vec!["-n", "30", "127.0.0.1"])
+    }
+
     #[test]
+    #[cfg(unix)]
     fn resolve_binary_finds_path_entries_and_rejects_missing() {
         assert!(Supervisor::resolve_binary("sh").is_some());
         assert!(Supervisor::resolve_binary("herd-definitely-not-a-binary-xyz").is_none());
         assert!(Supervisor::resolve_binary("/bin/sh").is_some());
         assert!(Supervisor::resolve_binary("/bin/no-such-binary-xyz").is_none());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn resolve_binary_finds_windows_executables() {
+        assert!(Supervisor::resolve_binary("cmd.exe").is_some());
+        assert!(Supervisor::resolve_binary("ping.exe").is_some());
+        assert!(Supervisor::resolve_binary("herd-definitely-not-a-binary-xyz").is_none());
+        assert!(Supervisor::resolve_binary("C:\\Windows\\System32\\cmd.exe").is_some());
+        assert!(
+            Supervisor::resolve_binary("C:\\Windows\\System32\\no-such-binary-xyz.exe").is_none()
+        );
     }
 
     #[tokio::test]
@@ -417,6 +442,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn start_stop_sleep_and_read_logs() {
         let dir = tmp_logs("sleep");
         let mut sup = Supervisor::new(dir.clone()).unwrap();
@@ -461,6 +487,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(unix)]
     async fn stop_kills_group_after_leader_exits() {
         let dir = tmp_logs("group-after-leader");
         let mut sup = Supervisor::new(dir.clone()).unwrap();
@@ -495,6 +522,29 @@ mod tests {
         let probe = unsafe { libc::kill(grandchild, 0) };
         assert_eq!(probe, -1, "grandchild {grandchild} survived stop");
         assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// On Windows there is no process group to signal: `stop` kills
+    /// the direct child only. A grandchild (a shell background job,
+    /// for example) can survive; that limitation is documented in
+    /// docs/daemon-g1-g4.md.
+    #[tokio::test]
+    #[cfg(windows)]
+    async fn stop_kills_direct_child_on_windows() {
+        let dir = tmp_logs("win-stop");
+        let mut sup = Supervisor::new(dir.clone()).unwrap();
+        let (cmd, args) = sleeper_command();
+        let service = def("pinger", cmd, args, None);
+        let pid = sup.start(&service).await.unwrap();
+        assert!(pid > 0);
+        assert_eq!(sup.status("pinger"), "running");
+        let code = sup.stop("pinger").await.unwrap();
+        assert_eq!(sup.status("pinger"), "stopped");
+        // TerminateProcess reports exit code 1, unlike a Unix signal
+        // kill which reports no code.
+        assert_eq!(code, Some(1));
+        assert!(sup.stop("pinger").await.is_err(), "double stop must fail");
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -545,7 +595,8 @@ mod tests {
         // A listener on a free port, then a service bound to nothing.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let with_port = def("web", "sleep", vec!["300"], Some(port));
+        let (sleeper_cmd, sleeper_args) = sleeper_command();
+        let with_port = def("web", sleeper_cmd, sleeper_args, Some(port));
         sup.start(&with_port).await.unwrap();
         assert_eq!(sup.healthy(&with_port).await, Some(true));
         drop(listener);

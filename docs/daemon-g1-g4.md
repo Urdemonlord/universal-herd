@@ -125,7 +125,12 @@ Supervisi: proses anak di-spawn sebagai process-group leader di Unix,
 jadi `stop` mengirim SIGTERM ke seluruh group (anak + cucu), lalu
 menunggu sampai group itu kosong (bukan hanya sampai anak langsung
 keluar) selama maksimal 3 detik, lalu SIGKILL anggota yang tersisa.
-Service yang keluar sendiri dalam 100 ms pertama setelah
+Di Windows tidak ada process group: `stop` membunuh anak langsung
+saja (`Child::kill`), jadi cucu yang di-spawn service (misalnya
+background job dari shell) bisa selamat. Itu keterbatasan yang
+diketahui, bukan bug yang disembunyikan: tes `stop_kills_direct_child_on_windows`
+membuktikan anak langsung mati, tes group kill hanya jalan di Unix
+(`#[cfg(unix)]`). Service yang keluar sendiri dalam 100 ms pertama setelah
 start dilaporkan gagal start beserta exit code-nya, bukan dilaporkan
 berhasil lalu mati diam-diam. `services.logs` membaca dari akhir file
 dengan buffer terbatas (maksimal ~1 MiB), jadi log yang tumbuh sampai

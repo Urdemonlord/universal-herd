@@ -228,16 +228,41 @@ pub fn lexical_normalize(raw: &Path) -> PathBuf {
 }
 
 /// Resolve a path naming a stored registration (unpark/unlink):
-/// canonicalize when the directory still exists, otherwise absolutize
-/// lexically (relative to the current directory) without touching the
-/// filesystem, so a deleted directory can still be unregistered.
-/// A symlinked path whose target is gone will not match the stored
-/// canonical path; that case still reports "not parked/linked".
+/// canonicalize when the directory still exists, otherwise
+/// canonicalize the deepest existing ancestor and append the deleted
+/// tail lexically, so symlinks in the surviving prefix still
+/// resolve (e.g. on macOS /var is a symlink to /private/var, and a
+/// directory deleted under it must still match the canonical path
+/// stored when it was linked). Only when the symlink itself is in
+/// the deleted tail can the path no longer be resolved, and that
+/// case still reports "not parked/linked".
 pub fn stored_dir(raw: &Path) -> PathBuf {
     if let Ok(canonical) = fs::canonicalize(raw) {
         return canonical;
     }
-    lexical_normalize(raw)
+    let absolute = lexical_normalize(raw);
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    let mut prefix = absolute.as_path();
+    loop {
+        match fs::canonicalize(prefix) {
+            Ok(canonical) => {
+                let mut out = canonical;
+                for component in suffix.iter().rev() {
+                    out.push(component);
+                }
+                return out;
+            }
+            Err(_) => match prefix.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => {
+                    if let Some(name) = prefix.file_name() {
+                        suffix.push(name.to_os_string());
+                    }
+                    prefix = parent;
+                }
+                _ => return absolute,
+            },
+        }
+    }
 }
 
 fn path_string(path: &Path) -> String {
@@ -938,24 +963,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stored_dir_canonicalizes_when_present_and_absolutizes_when_deleted() {
+    fn stored_dir_canonicalizes_when_present_and_deleted() {
         let base =
             std::env::temp_dir().join(format!("herd-stored-dir-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         let target = base.join("sub").join("proj");
         fs::create_dir_all(&target).unwrap();
-        // Existing directory: canonicalized (resolves `.` segments).
-        assert_eq!(stored_dir(&base.join("sub").join(".").join("proj")), target);
-        // Deleted directory: no filesystem access, but the absolute
-        // path (with `.`/`..` resolved lexically) is still returned.
+        // Existing directory: canonicalized (resolves `.` segments and
+        // symlinks, e.g. /var on macOS is a symlink to /private/var),
+        // so the expectation is canonicalized too.
+        let target_canonical = fs::canonicalize(&target).unwrap();
+        assert_eq!(stored_dir(&base.join("sub").join(".").join("proj")), target_canonical);
+        // Deleted directory: the surviving prefix still resolves, so
+        // the deleted path matches what was stored when it existed.
+        // The expectation is the canonical base (identical to `base`
+        // unless the temp dir itself is reached through a symlink).
+        let base_canonical = fs::canonicalize(&base).unwrap();
+        let deleted_target = base_canonical.join("sub").join("proj");
         fs::remove_dir_all(&base).unwrap();
-        assert_eq!(stored_dir(&target), target);
-        assert_eq!(stored_dir(&base.join("sub").join("..").join("sub").join("proj")), target);
+        assert_eq!(stored_dir(&target), deleted_target);
+        assert_eq!(
+            stored_dir(&base.join("sub").join("..").join("sub").join("proj")),
+            deleted_target
+        );
         // A relative path is resolved against the current directory.
         let cwd = std::env::current_dir().unwrap();
         let relative = target.strip_prefix(&cwd).ok().map(|p| p.to_path_buf());
         if let Some(relative) = relative {
             assert_eq!(stored_dir(&relative), target);
         }
+        // Deleted directory under a symlinked parent: the symlink in
+        // the surviving prefix still resolves, so the deleted path
+        // matches what was stored when it existed (the macOS TMPDIR
+        // case: /var is a symlink to /private/var).
+        let link_base =
+            std::env::temp_dir().join(format!("herd-stored-dir-link-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&link_base);
+        let real = link_base.join("real");
+        let target = real.join("proj");
+        fs::create_dir_all(&target).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, link_base.join("link")).unwrap();
+        #[cfg(unix)]
+        {
+            let target_canonical = fs::canonicalize(&target).unwrap();
+            let via_link = link_base.join("link").join("proj");
+            assert_eq!(stored_dir(&via_link), target_canonical);
+            fs::remove_dir_all(&target).unwrap();
+            assert_eq!(stored_dir(&via_link), target_canonical);
+        }
+        let _ = fs::remove_dir_all(&link_base);
     }
 }
