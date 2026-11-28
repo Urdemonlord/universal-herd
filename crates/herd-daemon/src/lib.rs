@@ -944,8 +944,11 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         let target = base.join("sub").join("proj");
         fs::create_dir_all(&target).unwrap();
-        // Existing directory: canonicalized (resolves `.` segments).
-        assert_eq!(stored_dir(&base.join("sub").join(".").join("proj")), target);
+        // Existing directory: canonicalized (resolves `.` segments and
+        // symlinks, e.g. /var on macOS is a symlink to /private/var),
+        // so the expectation is canonicalized too.
+        let target_canonical = fs::canonicalize(&target).unwrap();
+        assert_eq!(stored_dir(&base.join("sub").join(".").join("proj")), target_canonical);
         // Deleted directory: no filesystem access, but the absolute
         // path (with `.`/`..` resolved lexically) is still returned.
         fs::remove_dir_all(&base).unwrap();
