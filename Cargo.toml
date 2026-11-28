@@ -19,6 +19,9 @@ authors = ["Meow Labs"]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 directories = "6"
+http-body-util = "=0.1.5"
+hyper = { version = "=1.13.0", features = ["http1", "server", "client"] }
+hyper-util = { version = "=0.1.21", features = ["client-legacy", "http1", "tokio"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

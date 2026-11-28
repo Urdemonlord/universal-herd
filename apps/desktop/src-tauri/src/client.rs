@@ -104,13 +104,13 @@ mod tests {
         let (port, _task) = mock_daemon(|request| {
             assert_eq!(request.method, "system.status");
             assert_eq!(request.token.as_deref(), Some("test-token"));
-            Ok(json!({"status": "running", "protocol": "1.2"}))
+            Ok(json!({"status": "running", "protocol": "1.3"}))
         })
         .await;
         let result =
             call_at("system.status", json!({}), "test-token", ("127.0.0.1", port)).await.unwrap();
         assert_eq!(result["status"], "running");
-        assert_eq!(result["protocol"], "1.2");
+        assert_eq!(result["protocol"], "1.3");
     }
 
     #[tokio::test]

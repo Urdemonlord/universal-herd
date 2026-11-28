@@ -8,6 +8,9 @@ license.workspace = true
 anyhow.workspace = true
 directories.workspace = true
 herd-core = { path = "../herd-core" }
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 libc.workspace = true
 herd-protocol = { path = "../herd-protocol" }
 serde.workspace = true
