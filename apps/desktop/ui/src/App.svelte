@@ -299,7 +299,13 @@
       domains = d.domains;
     } catch (e) {
       if (gen !== refreshGen) return;
+      connected = false;
+      daemonProtocol = '';
       error = fail(e);
+      projects = [];
+      runtimes = [];
+      services = [];
+      domains = [];
     } finally {
       if (gen === refreshGen) loading = false;
     }
