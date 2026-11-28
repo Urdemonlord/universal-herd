@@ -209,11 +209,23 @@
     notice = text;
   }
 
+  // Generation counter for list refreshes: refresh() and refreshLists()
+  // can overlap (the Refresh button stays enabled while a toggle's
+  // refreshLists() runs, and a toggle can start while refresh() runs).
+  // Every fetch bumps the counter and only the newest generation may
+  // apply its results, so a slow older fetch can never overwrite state
+  // fetched after it. Whoever holds the newest generation when it
+  // finishes also clears `loading`, which refresh() sets, so `loading`
+  // can never stick true when a refreshLists() supersedes a refresh().
+  let refreshGen = 0;
+
   async function refresh() {
+    const gen = ++refreshGen;
     loading = true;
     error = '';
     try {
       const status = await invoke<{ protocol: string; version: string }>('daemon_status');
+      if (gen !== refreshGen) return;
       connected = true;
       daemonProtocol = status.protocol;
       const [p, r, s, d] = await Promise.all([
@@ -222,11 +234,13 @@
         invoke<{ services: Service[] }>('list_services'),
         invoke<{ domains: Domain[] }>('list_domains'),
       ]);
+      if (gen !== refreshGen) return;
       projects = p.projects;
       runtimes = r.runtimes;
       services = s.services;
       domains = d.domains;
     } catch (e) {
+      if (gen !== refreshGen) return;
       connected = false;
       daemonProtocol = '';
       error = fail(e);
@@ -235,7 +249,7 @@
       services = [];
       domains = [];
     } finally {
-      loading = false;
+      if (gen === refreshGen) loading = false;
     }
   }
 
@@ -270,6 +284,7 @@
   }
 
   async function refreshLists() {
+    const gen = ++refreshGen;
     try {
       const [p, r, s, d] = await Promise.all([
         invoke<{ projects: Project[] }>('list_projects'),
@@ -277,12 +292,16 @@
         invoke<{ services: Service[] }>('list_services'),
         invoke<{ domains: Domain[] }>('list_domains'),
       ]);
+      if (gen !== refreshGen) return;
       projects = p.projects;
       runtimes = r.runtimes;
       services = s.services;
       domains = d.domains;
     } catch (e) {
+      if (gen !== refreshGen) return;
       error = fail(e);
+    } finally {
+      if (gen === refreshGen) loading = false;
     }
   }
 
