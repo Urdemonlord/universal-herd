@@ -297,6 +297,18 @@ mod tests {
         dir
     }
 
+    /// Extract the CN value from `openssl x509 -subject` / `-issuer`
+    /// output. Tolerates both spellings vendors print: `CN = value`
+    /// (OpenSSL 3.0 default) and `CN=value` (newer OpenSSL and
+    /// LibreSSL, which is what the GitHub runners print). Only the
+    /// value up to the next RDN separator is returned, so extra
+    /// fields after the CN do not matter.
+    fn cn_of_dn(output: &str) -> Option<String> {
+        let normalized = output.replace(" = ", "=");
+        let rest = normalized.split("CN=").nth(1)?;
+        Some(rest.split([',', '\n']).next()?.trim().to_string())
+    }
+
     #[test]
     fn ca_and_leaf_roundtrip_with_real_openssl() {
         let Some(openssl) = openssl_or_skip() else {
@@ -332,7 +344,21 @@ mod tests {
         )
         .unwrap();
         assert!(text.contains("DNS:myapp.test"), "{text}");
-        assert!(text.contains("Issuer: CN = Herd Local CA"), "{text}");
+        // The issuer is checked on its own line, not in the -text dump,
+        // so the assertion does not depend on how this openssl spells
+        // the DN (see cn_of_dn).
+        let issuer = run(
+            &openssl,
+            &[
+                "x509",
+                "-in",
+                leaf_crt_path(&dir, "myapp.test").to_str().unwrap(),
+                "-noout",
+                "-issuer",
+            ],
+        )
+        .unwrap();
+        assert_eq!(cn_of_dn(&issuer).as_deref(), Some(CA_ISSUER), "{issuer}");
         let verify = run(
             &openssl,
             &[
@@ -368,6 +394,21 @@ mod tests {
         // trimmed before the ellipsis is added.
         assert_eq!(cn, format!("{}...", "a".repeat(60)));
         assert_eq!(leaf_cn(&"a".repeat(65)), format!("{}...", "a".repeat(61)));
+    }
+
+    #[test]
+    fn cn_extraction_tolerates_both_dn_spellings() {
+        // OpenSSL 3.0 default.
+        assert_eq!(cn_of_dn("subject=CN = myapp.test\n").as_deref(), Some("myapp.test"));
+        // Newer OpenSSL and LibreSSL: no spaces around '='.
+        assert_eq!(cn_of_dn("subject=CN=myapp.test\n").as_deref(), Some("myapp.test"));
+        // Extra RDN fields after the CN stop the value.
+        assert_eq!(
+            cn_of_dn("issuer=CN = Herd Local CA, O = Meow Labs\n").as_deref(),
+            Some("Herd Local CA")
+        );
+        assert_eq!(cn_of_dn("subject=CN=aaa...\n").as_deref(), Some("aaa..."));
+        assert_eq!(cn_of_dn("subject=OU = nobody here\n"), None);
     }
 
     /// The modulus of a key and its certificate must match; comparing
@@ -440,7 +481,8 @@ mod tests {
             &["x509", "-in", leaf_crt_path(&dir, &domain).to_str().unwrap(), "-noout", "-subject"],
         )
         .unwrap();
-        assert!(subject.contains(&format!("CN = {}...", "a".repeat(60))), "{subject}");
+        let expected_cn = format!("{}...", "a".repeat(60));
+        assert_eq!(cn_of_dn(&subject).as_deref(), Some(expected_cn.as_str()), "{subject}");
         no_temp_files_left(&dir);
         fs::remove_dir_all(dir).unwrap();
     }
