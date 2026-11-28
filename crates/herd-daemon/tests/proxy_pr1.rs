@@ -94,6 +94,39 @@ async fn http_get(port: u16, host: &str, path: &str) -> (u16, String) {
     (status, body)
 }
 
+/// One raw HTTP GET over a keep-alive connection. Returns
+/// (status, body, stream): the caller keeps the stream open to prove
+/// `proxy.stop` closes it.
+async fn http_get_keepalive(port: u16, host: &str, path: &str) -> (u16, String, TcpStream) {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let header_end = loop {
+        let n = stream.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "connection closed before response");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let status: u16 = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let content_length: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    while buf.len() < header_end + content_length {
+        let n = stream.read(&mut chunk).await.unwrap();
+        assert!(n > 0, "connection closed mid-body");
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let body = String::from_utf8_lossy(&buf[header_end..header_end + content_length]).to_string();
+    (status, body, stream)
+}
+
 const UPSTREAM_PY: &str = r#"
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -133,6 +166,13 @@ async fn proxy_http_routes_start_stop_and_serve() {
     let blog = fs::canonicalize(base.join("blog")).unwrap();
     fs::create_dir_all(web.join("public")).unwrap();
     fs::write(web.join("public").join("index.html"), "static-marker-web").unwrap();
+    fs::write(web.join("public").join("hello world.html"), "spaced-marker").unwrap();
+    // A directory outside the docroot, reachable only through a
+    // symlink planted inside it: static serving must never leak it.
+    fs::create_dir_all(base.join("outside")).unwrap();
+    fs::write(base.join("outside").join("secret.txt"), "secret-marker-outside").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(base.join("outside"), web.join("public").join("private")).unwrap();
     fs::write(api.join("upstream.py"), UPSTREAM_PY).unwrap();
 
     let state = DaemonState::load(&config_dir).unwrap();
@@ -221,6 +261,21 @@ async fn proxy_http_routes_start_stop_and_serve() {
     let (code, body) = http_get(proxy_port, "web.test", "/").await;
     assert_eq!(code, 200);
     assert_eq!(body, "static-marker-web");
+    // Percent-encoded paths resolve to the real file, and encoded
+    // traversal is rejected like plain traversal.
+    let (code, body) = http_get(proxy_port, "web.test", "/hello%20world.html").await;
+    assert_eq!(code, 200);
+    assert_eq!(body, "spaced-marker");
+    let (code, body) = http_get(proxy_port, "web.test", "/%2e%2e/Cargo.toml").await;
+    assert_eq!(code, 200);
+    assert!(body.contains("web.test"), "{body}");
+    #[cfg(unix)]
+    {
+        let (code, body) = http_get(proxy_port, "web.test", "/private/secret.txt").await;
+        assert_eq!(code, 200);
+        assert!(body.contains("web.test"), "{body}");
+        assert!(!body.contains("secret-marker-outside"), "{body}");
+    }
     let (code, body) = http_get(proxy_port, "web.test", "/missing.html").await;
     assert_eq!(code, 200);
     assert!(body.contains("web.test"), "{body}");
@@ -243,6 +298,22 @@ async fn proxy_http_routes_start_stop_and_serve() {
     let proxy_status = client.ok("proxy.status", json!({})).await;
     assert_eq!(proxy_status["running"], false);
 
+    // Restart after stop works, and stop closes an open keep-alive
+    // connection: no request can be served on it after stop returns.
+    let started = client.ok("proxy.start", json!({"port": proxy_port})).await;
+    assert_eq!(started["running"], true);
+    let (code, body, mut kept) = http_get_keepalive(proxy_port, "web.test", "/").await;
+    assert_eq!(code, 200);
+    assert_eq!(body, "static-marker-web");
+    let stopped = client.ok("proxy.stop", json!({})).await;
+    assert_eq!(stopped["running"], false);
+    let mut probe = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(2), kept.read(&mut probe)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0))),
+        "keep-alive connection should be closed by proxy.stop, got {closed:?}"
+    );
+
     // -32010 when the port is already taken, naming the owner when
     // it can be detected (the test process owns this listener).
     let taken_port = free_port().await;
@@ -252,12 +323,32 @@ async fn proxy_http_routes_start_stop_and_serve() {
     assert!(message.contains(&taken_port.to_string()), "{message}");
     assert!(message.contains("Address already in use"), "{message}");
     let owner = herd_daemon::proxy::port_owner(taken_port);
+    #[cfg(target_os = "linux")]
     assert!(owner.is_some(), "port_owner should find the test process");
+    #[cfg(not(target_os = "linux"))]
+    assert!(owner.is_none(), "port_owner always returns None off Linux");
     drop(_holder);
 
     // Bad port values are -32602.
     assert_eq!(client.err("proxy.start", json!({"port": 0})).await.0, -32602);
     assert_eq!(client.err("proxy.start", json!({"port": 70000})).await.0, -32602);
+
+    // A service workdir spelled with a trailing "/." is stored
+    // canonicalized, so it matches the linked project.
+    let created = client
+        .ok(
+            "services.create",
+            json!({
+                "name": "dotsvc",
+                "command": "python3",
+                "args": ["upstream.py"],
+                "port": free_port().await,
+                "workdir": format!("{}/.", blog.to_str().unwrap()),
+            }),
+        )
+        .await;
+    assert_eq!(created["workdir"], blog.to_str().unwrap());
+    client.ok("services.remove", json!({"name": "dotsvc"})).await;
 
     client.ok("services.stop", json!({"name": "api"})).await;
     fs::remove_dir_all(base).unwrap();

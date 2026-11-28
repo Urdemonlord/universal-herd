@@ -24,7 +24,7 @@
 //! report, section 0); the versions are pinned exactly in the
 //! workspace `Cargo.toml`.
 
-use crate::{DaemonState, state::State};
+use crate::{DaemonState, lexical_normalize, state::State};
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1;
@@ -38,10 +38,17 @@ use std::{
     collections::HashSet,
     convert::Infallible,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::SystemTime,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime},
 };
-use tokio::{net::TcpListener, sync::watch, task::JoinHandle};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, watch},
+    task::{JoinHandle, JoinSet},
+};
 
 /// Default HTTP listen port. `proxy.start` accepts an explicit port
 /// for tests and for machines where 80 is taken; production use is
@@ -113,7 +120,10 @@ pub fn find_docroot(project: &Path) -> Option<PathBuf> {
 /// holds the names of services that are currently running; only a
 /// running service that declares a port and whose `workdir` is the
 /// linked project becomes a proxy target. When several services match
-/// one project, the first in state order wins.
+/// one project, the first in state order wins. Workdirs are compared
+/// after lexical normalization, so a service stored before the
+/// `services.create` boundary canonicalized workdirs (e.g.
+/// `/srv/web/.`) still matches the linked `/srv/web`.
 pub fn compute_routes(state: &State, running: &HashSet<String>) -> Vec<RouteInfo> {
     let mut routes: Vec<RouteInfo> = state
         .links
@@ -124,8 +134,10 @@ pub fn compute_routes(state: &State, running: &HashSet<String>) -> Vec<RouteInfo
                 .services
                 .iter()
                 .find(|def| {
-                    def.workdir.as_deref() == Some(link.path.as_str())
-                        && def.port.is_some()
+                    def.workdir.as_deref().is_some_and(|workdir| {
+                        lexical_normalize(Path::new(workdir))
+                            == lexical_normalize(Path::new(&link.path))
+                    }) && def.port.is_some()
                         && running.contains(&def.name)
                 })
                 .map(|def| RouteTarget::Proxy {
@@ -141,80 +153,179 @@ pub fn compute_routes(state: &State, running: &HashSet<String>) -> Vec<RouteInfo
     routes
 }
 
-/// Resolve a static file under `docroot` for `path`. Returns `None`
-/// when the file does not exist or the path tries to escape the
-/// docroot. A directory request serves that directory's `index.html`.
-fn resolve_static(docroot: &Path, path: &str) -> Option<PathBuf> {
-    if path.split('/').any(|segment| segment == "..") {
-        return None;
+/// Percent-decode a URI path (std-only; no new dependency for a
+/// 15-line decoder). Returns `None` when an escape is malformed or
+/// the decoded bytes are not valid UTF-8. `+` stays a literal plus:
+/// in a path segment it is not a space.
+fn percent_decode_path(path: &str) -> Option<String> {
+    if !path.contains('%') {
+        return Some(path.to_string());
     }
-    let rel = path.trim_start_matches('/');
-    let rel = if rel.is_empty() { "index.html" } else { rel };
-    let candidate = docroot.join(rel);
-    if candidate.is_file() {
-        return Some(candidate);
-    }
-    if candidate.is_dir() {
-        let index = candidate.join("index.html");
-        if index.is_file() {
-            return Some(index);
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return None;
+                }
+                let hi = hex_val(bytes[i + 1])?;
+                let lo = hex_val(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
         }
     }
-    None
+    String::from_utf8(out).ok()
 }
 
-/// Resolve one request against the computed routes.
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Resolve a static file under `docroot` for `path`. Returns `None`
+/// when the file does not exist, the path tries to escape the
+/// docroot, or the path is not decodable to valid UTF-8. A directory
+/// request serves that directory's `index.html`.
+fn resolve_static(docroot: &Path, path: &str) -> Option<PathBuf> {
+    // Decode first: an encoded `%2e%2e` segment must be caught by the
+    // `..` check below, and `/hello%20world.html` must find the real
+    // file. Decoding after the check would let encoded traversal
+    // through.
+    let decoded = percent_decode_path(path)?;
+    if decoded.split('/').any(|segment| segment == "..") {
+        return None;
+    }
+    let rel = decoded.trim_start_matches('/');
+    let rel = if rel.is_empty() { "index.html" } else { rel };
+    let candidate = docroot.join(rel);
+    let file = if candidate.is_file() {
+        candidate
+    } else if candidate.is_dir() {
+        let index = candidate.join("index.html");
+        if index.is_file() {
+            index
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    // Symlink containment: the resolved file must stay inside the
+    // canonical docroot. `is_file` follows symlinks, so without this
+    // a symlink inside the docroot pointing outside would serve
+    // files from outside the project.
+    let docroot = std::fs::canonicalize(docroot).ok()?;
+    let resolved = std::fs::canonicalize(&file).ok()?;
+    if resolved.starts_with(&docroot) { Some(file) } else { None }
+}
+
+/// Resolve one request against the computed routes. When several
+/// linked domains match a host (an explicitly linked child like
+/// `z.app.test` and its parent `app.test`), the longest (most
+/// specific) domain wins; a host that only matches the parent still
+/// falls back to the parent's site.
 pub fn resolve_route(host: &str, path: &str, routes: &[RouteInfo]) -> ResolvedRoute {
     let host = bare_host(host);
-    for route in routes {
-        if !host_matches(&host, &route.domain) {
-            continue;
-        }
-        return match &route.target {
-            RouteTarget::Proxy { port, .. } => ResolvedRoute::Proxy { port: *port },
-            RouteTarget::Static { docroot } => match resolve_static(docroot, path) {
-                Some(file) => ResolvedRoute::Static { file },
-                None => ResolvedRoute::Placeholder { domain: route.domain.clone() },
-            },
-            RouteTarget::Placeholder => ResolvedRoute::Placeholder { domain: route.domain.clone() },
-        };
+    let Some(route) = routes
+        .iter()
+        .filter(|route| host_matches(&host, &route.domain))
+        .max_by_key(|route| route.domain.len())
+    else {
+        return ResolvedRoute::Unknown;
+    };
+    match &route.target {
+        RouteTarget::Proxy { port, .. } => ResolvedRoute::Proxy { port: *port },
+        RouteTarget::Static { docroot } => match resolve_static(docroot, path) {
+            Some(file) => ResolvedRoute::Static { file },
+            None => ResolvedRoute::Placeholder { domain: route.domain.clone() },
+        },
+        RouteTarget::Placeholder => ResolvedRoute::Placeholder { domain: route.domain.clone() },
     }
-    ResolvedRoute::Unknown
 }
 
 /// Compute the current routes from the daemon state: links and service
 /// definitions from the store, running services from the supervisor.
 /// Lock order is store-then-supervisor, the same as `services.list`;
-/// never the reverse.
+/// never the reverse. The store read guard is held across the
+/// supervisor lock and the running-set computation: `services.remove`
+/// needs the write lock to delete a definition, so it cannot
+/// interleave between the snapshot and the running check, and a stale
+/// definition can never pass the name-based `is_running` check.
 pub async fn current_routes(state: &DaemonState) -> Vec<RouteInfo> {
-    let (links, services) = {
-        let store = state.store.read().await;
-        (store.state.links.clone(), store.state.services.clone())
-    };
+    let store = state.store.read().await;
+    let links = store.state.links.clone();
+    let services = store.state.services.clone();
     let mut supervisor = state.supervisor.lock().await;
     let running: HashSet<String> = services
         .iter()
         .filter(|def| def.port.is_some() && supervisor.is_running(&def.name))
         .map(|def| def.name.clone())
         .collect();
+    drop(supervisor);
+    drop(store);
     let snapshot = State { links, services, ..Default::default() };
     compute_routes(&snapshot, &running)
 }
 
-/// A running proxy server: its port, start time, and the shutdown
-/// signal plus task that stop it.
+/// How many consecutive accept errors the listener tolerates before
+/// it is declared terminated. Accept errors on a bound listener are
+/// usually transient (fd exhaustion), so they are retried with
+/// backoff first; a listener that keeps failing is not retried
+/// forever.
+const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 10;
+
+/// Backoff after the Nth consecutive accept error, or `None` when the
+/// listener has failed too many times in a row and should be declared
+/// terminated. 100ms, doubling to a 1s cap.
+fn accept_retry_delay(consecutive_errors: u32) -> Option<Duration> {
+    if consecutive_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS {
+        return None;
+    }
+    let shift = consecutive_errors.saturating_sub(1).min(4);
+    Some((Duration::from_millis(100) * (1u32 << shift)).min(Duration::from_secs(1)))
+}
+
+/// A running proxy server: its port, start time, the shutdown signal,
+/// the accept-loop task, the accepted connections it owns, and
+/// whether its listener gave up after repeated accept errors.
 pub struct ProxyHandle {
     pub port: u16,
     pub started_at: SystemTime,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<()>,
+    connections: Arc<Mutex<JoinSet<()>>>,
+    terminated: Arc<AtomicBool>,
 }
 
 impl ProxyHandle {
-    /// Signal the accept loop to stop and wait for it to finish.
+    /// True when the accept loop gave up after repeated accept errors.
+    /// The slot still holds the handle, but `proxy.status` reports
+    /// not running and `proxy.start` may replace it.
+    pub fn is_terminated(&self) -> bool {
+        self.terminated.load(Ordering::SeqCst)
+    }
+
+    /// Signal the accept loop to stop, wait for it to finish, then
+    /// wait for every accepted connection to finish its graceful
+    /// shutdown. `stop` does not return while a connection is still
+    /// serving: a client with an open keep-alive connection cannot
+    /// send another request after `stop` returns.
     pub async fn stop(self) {
         let _ = self.shutdown.send(true);
         let _ = self.task.await;
+        let mut connections = self.connections.lock().await;
+        while connections.join_next().await.is_some() {}
     }
 }
 
@@ -230,37 +341,83 @@ pub async fn start_proxy(state: Arc<DaemonState>, port: u16) -> Result<ProxyHand
         Client::builder(TokioExecutor::new()).build_http();
     let http = Arc::new(HttpState { client, daemon: state });
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-    let task = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown_rx.changed() => break,
-                accepted = listener.accept() => {
-                    match accepted {
-                        Ok((stream, _)) => {
-                            let http = Arc::clone(&http);
-                            tokio::spawn(async move {
-                                let io = TokioIo::new(stream);
-                                if let Err(error) = http1::Builder::new()
-                                    .serve_connection(
-                                        io,
-                                        service_fn(move |req| handle_request(Arc::clone(&http), req)),
-                                    )
-                                    .await
-                                {
-                                    tracing::warn!(%error, "proxy connection error");
+    let connections: Arc<Mutex<JoinSet<()>>> = Arc::new(Mutex::new(JoinSet::new()));
+    let terminated = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn({
+        let connections = Arc::clone(&connections);
+        let terminated = Arc::clone(&terminated);
+        let shutdown_tx = shutdown_tx.clone();
+        async move {
+            let mut consecutive_errors = 0u32;
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    accepted = listener.accept() => {
+                        match accepted {
+                            Ok((stream, _)) => {
+                                consecutive_errors = 0;
+                                let http = Arc::clone(&http);
+                                let mut conn_shutdown = shutdown_tx.subscribe();
+                                let conns = Arc::clone(&connections);
+                                conns.lock().await.spawn(async move {
+                                    let mut conn = Box::pin(http1::Builder::new()
+                                        .serve_connection(
+                                            TokioIo::new(stream),
+                                            service_fn(move |req| {
+                                                handle_request(Arc::clone(&http), req)
+                                            }),
+                                        ));
+                                    tokio::select! {
+                                        _ = conn_shutdown.changed() => {
+                                            // Keep polling until the
+                                            // connection finishes its
+                                            // graceful shutdown below.
+                                            conn.as_mut().graceful_shutdown();
+                                        }
+                                        result = conn.as_mut() => {
+                                            if let Err(error) = result {
+                                                tracing::warn!(%error, "proxy connection error");
+                                            }
+                                            return;
+                                        }
+                                    }
+                                    if let Err(error) = conn.as_mut().await {
+                                        tracing::warn!(%error, "proxy connection error");
+                                    }
+                                });
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "proxy accept error");
+                                consecutive_errors += 1;
+                                match accept_retry_delay(consecutive_errors) {
+                                    Some(delay) => tokio::time::sleep(delay).await,
+                                    None => {
+                                        tracing::error!(
+                                            "proxy listener failed repeatedly; proxy terminated"
+                                        );
+                                        // Wake the connections too: a
+                                        // dead listener must not leave
+                                        // keep-alive connections serving.
+                                        let _ = shutdown_tx.send(true);
+                                        terminated.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
                                 }
-                            });
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "proxy accept error");
-                            break;
+                            }
                         }
                     }
                 }
             }
         }
     });
-    Ok(ProxyHandle { port, started_at: SystemTime::now(), shutdown: shutdown_tx, task })
+    Ok(ProxyHandle {
+        port,
+        started_at: SystemTime::now(),
+        shutdown: shutdown_tx,
+        task,
+        connections,
+        terminated,
+    })
 }
 
 struct HttpState {
@@ -652,6 +809,148 @@ mod tests {
             ResolvedRoute::Placeholder { domain: "static.test".into() }
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn service_workdir_trailing_dot_matches_link() {
+        let dir = tmp_dir("workdir-dot");
+        let web = dir.join("web");
+        fs::create_dir_all(&web).unwrap();
+        let state = state_with(
+            vec![(web.to_str().unwrap(), "myapp.test")],
+            vec![service("web", Some(&format!("{}/.", web.to_str().unwrap())), Some(18081))],
+        );
+        let running: HashSet<String> = ["web".to_string()].into_iter().collect();
+        let routes = compute_routes(&state, &running);
+        assert_eq!(routes[0].target, RouteTarget::Proxy { service: "web".into(), port: 18081 });
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn service_workdir_dotdot_spelling_matches_link() {
+        let dir = tmp_dir("workdir-dotdot");
+        let web = dir.join("web");
+        fs::create_dir_all(&web).unwrap();
+        let state = state_with(
+            vec![(web.to_str().unwrap(), "myapp.test")],
+            vec![service(
+                "web",
+                Some(&format!("{}/sub/../web", dir.to_str().unwrap())),
+                Some(18081),
+            )],
+        );
+        let running: HashSet<String> = ["web".to_string()].into_iter().collect();
+        let routes = compute_routes(&state, &running);
+        assert_eq!(routes[0].target, RouteTarget::Proxy { service: "web".into(), port: 18081 });
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn percent_encoded_static_paths() {
+        let dir = tmp_dir("pct-decode");
+        let docroot = dir.join("public");
+        fs::create_dir_all(&docroot).unwrap();
+        fs::write(docroot.join("hello world.html"), "spaced").unwrap();
+        fs::write(docroot.join("index.html"), "home").unwrap();
+        let routes = vec![RouteInfo {
+            domain: "static.test".into(),
+            project: dir.to_str().unwrap().into(),
+            target: RouteTarget::Static { docroot: docroot.clone() },
+        }];
+        assert_eq!(
+            resolve_route("static.test", "/hello%20world.html", &routes),
+            ResolvedRoute::Static { file: docroot.join("hello world.html") }
+        );
+        // Encoded traversal must be caught after decoding.
+        assert_eq!(
+            resolve_route("static.test", "/%2e%2e/Cargo.toml", &routes),
+            ResolvedRoute::Placeholder { domain: "static.test".into() }
+        );
+        assert_eq!(
+            resolve_route("static.test", "/%2E%2E/Cargo.toml", &routes),
+            ResolvedRoute::Placeholder { domain: "static.test".into() }
+        );
+        // Invalid UTF-8 after decoding is rejected, not served.
+        assert_eq!(
+            resolve_route("static.test", "/%FF.html", &routes),
+            ResolvedRoute::Placeholder { domain: "static.test".into() }
+        );
+        // A malformed escape is rejected.
+        assert_eq!(
+            resolve_route("static.test", "/foo%2.html", &routes),
+            ResolvedRoute::Placeholder { domain: "static.test".into() }
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_inside_docroot_cannot_escape() {
+        use std::os::unix::fs::symlink;
+        let dir = tmp_dir("symlink-escape");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        let docroot = dir.join("public");
+        fs::create_dir_all(&docroot).unwrap();
+        fs::write(docroot.join("index.html"), "home").unwrap();
+        fs::write(docroot.join("real.txt"), "real").unwrap();
+        symlink(&outside, docroot.join("private")).unwrap();
+        let routes = vec![RouteInfo {
+            domain: "static.test".into(),
+            project: dir.to_str().unwrap().into(),
+            target: RouteTarget::Static { docroot: docroot.clone() },
+        }];
+        assert_eq!(
+            resolve_route("static.test", "/private/secret.txt", &routes),
+            ResolvedRoute::Placeholder { domain: "static.test".into() }
+        );
+        // A real file inside the docroot still serves.
+        assert_eq!(
+            resolve_route("static.test", "/real.txt", &routes),
+            ResolvedRoute::Static { file: docroot.join("real.txt") }
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_child_link_beats_parent() {
+        let routes = vec![
+            RouteInfo {
+                domain: "app.test".into(),
+                project: "/srv/app".into(),
+                target: RouteTarget::Placeholder,
+            },
+            RouteInfo {
+                domain: "z.app.test".into(),
+                project: "/srv/z".into(),
+                target: RouteTarget::Proxy { service: "z".into(), port: 18081 },
+            },
+        ];
+        assert_eq!(resolve_route("z.app.test", "/", &routes), ResolvedRoute::Proxy { port: 18081 });
+        assert_eq!(
+            resolve_route("api.z.app.test", "/", &routes),
+            ResolvedRoute::Proxy { port: 18081 }
+        );
+        assert_eq!(
+            resolve_route("app.test", "/", &routes),
+            ResolvedRoute::Placeholder { domain: "app.test".into() }
+        );
+        assert_eq!(
+            resolve_route("other.app.test", "/", &routes),
+            ResolvedRoute::Placeholder { domain: "app.test".into() }
+        );
+    }
+
+    #[test]
+    fn accept_retry_backoff_then_terminates() {
+        assert_eq!(accept_retry_delay(1), Some(Duration::from_millis(100)));
+        assert_eq!(accept_retry_delay(2), Some(Duration::from_millis(200)));
+        assert_eq!(accept_retry_delay(4), Some(Duration::from_millis(800)));
+        assert_eq!(accept_retry_delay(5), Some(Duration::from_secs(1)));
+        assert_eq!(accept_retry_delay(10), Some(Duration::from_secs(1)));
+        assert_eq!(accept_retry_delay(11), None);
+        assert_eq!(accept_retry_delay(100), None);
     }
 
     #[test]
