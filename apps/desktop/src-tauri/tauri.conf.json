@@ -22,5 +22,5 @@
     ],
     "security": { "csp": "default-src 'self'; img-src 'self' asset: data:; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost" }
   },
-  "bundle": { "active": true, "targets": "all", "externalBin": ["binaries/herd"] }
+  "bundle": { "active": true, "targets": "all", "icon": ["icons/icon.ico"], "externalBin": ["binaries/herd"] }
 }
